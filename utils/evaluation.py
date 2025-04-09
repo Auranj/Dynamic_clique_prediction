@@ -192,147 +192,196 @@ def evaluate_temporal_prediction(y_true_list, y_pred_list, y_score_list=None):
     
     return avg_metrics
 
-def evaluate_clique_evolution(true_evolution_list, pred_evolution_list, verbose=True):
-    """
-    评估团演化预测的性能，增强版
-    
+def evaluate_clique_evolution(y_true, y_pred, threshold=0.5, verbose=False):
+    """评估团演化预测的性能。
+    支持评估不同类型的演化关系（继续、增长、萎缩、分裂、合并）。
+
     Args:
-        true_evolution_list: 各时间步的真实团演化关系列表，每个元素是一个列表，包含多个(prev_idx, curr_idx)元组
-        pred_evolution_list: 各时间步的预测团演化关系列表，每个元素是一个列表，包含多个(prev_idx, curr_idx)元组
-        verbose: 是否打印详细的调试信息
-        
+        y_true (dict): 真实的团演化关系，格式为 time_step -> List[(prev_idx, curr_idx, evolution_type)]
+        y_pred (dict): 预测的团演化关系概率，格式为 time_step -> List[(prev_idx, curr_idx, prob, evolution_type)]
+                      或 time_step -> List[(prev_idx, curr_idx, prob)] (旧版本兼容)
+        threshold (float, optional): 预测概率阈值，默认为 0.5
+        verbose (bool, optional): 是否打印详细评估信息，默认为 False
+
     Returns:
-        dict: 包含评估指标的字典，包括准确率、精确率、召回率、F1值
+        dict: 包含各项评估指标的字典，包括总体指标和各类型演化关系的指标
     """
-    if not true_evolution_list or not pred_evolution_list:
-        if verbose:
-            print("[警告] 团演化评估: 空的评估列表")
+    if not y_true or not y_pred:
+        print("警告: y_true 或 y_pred 为空，无法进行评估")
         return {
-            'evolution_accuracy': 0.0,
-            'evolution_precision': 0.0,
-            'evolution_recall': 0.0,
-            'evolution_f1': 0.0
+            'accuracy': 0.0, 'precision': 0.0, 'recall': 0.0, 'f1': 0.0,
+            'ap': 0.0, 'auc': 0.0
         }
+
+    # 转换真实标签和预测为评估格式
+    labels = []
+    scores = []
+    predictions = []
     
-    # 数据分析
-    if verbose:
-        total_true_evolutions = sum(len(t) for t in true_evolution_list)
-        total_pred_evolutions = sum(len(p) for p in pred_evolution_list)
-        print(f"[团演化分析] 总样本数: {len(true_evolution_list)}")
-        print(f"[团演化分析] 总真实演化关系: {total_true_evolutions}")
-        print(f"[团演化分析] 总预测演化关系: {total_pred_evolutions}")
-        
-        true_distribution = {}
-        for time_step, true_evol in enumerate(true_evolution_list):
-            for prev_idx, curr_idx in true_evol:
-                key = (prev_idx, curr_idx)
-                if key not in true_distribution:
-                    true_distribution[key] = 0
-                true_distribution[key] += 1
-        
-        if true_distribution:
-            print(f"[团演化分析] 真实演化关系分布 (top 5):")
-            for i, (key, count) in enumerate(sorted(true_distribution.items(), key=lambda x: x[1], reverse=True)[:5]):
-                print(f"  - 前一时间步团索引 {key[0]} -> 当前时间步团索引 {key[1]}: {count}次")
+    # 收集用于每种演化类型评估的数据
+    type_labels = {'continue': [], 'grow': [], 'shrink': [], 'split': [], 'merge': []}
+    type_scores = {'continue': [], 'grow': [], 'shrink': [], 'split': [], 'merge': []}
+    type_predictions = {'continue': [], 'grow': [], 'shrink': [], 'split': [], 'merge': []}
     
-    # 初始化指标
-    total_accuracy = 0.0
-    total_precision = 0.0
-    total_recall = 0.0
-    total_f1 = 0.0
-    valid_steps = 0
+    # 跟踪总统计
+    total_true = 0
+    total_pred = 0
+    total_correct = 0
+    type_statistics = {t: {'true': 0, 'pred': 0, 'correct': 0} for t in type_labels}
     
-    # 详细的时间步指标
-    step_metrics = []
-    
-    # 遍历每个时间步
-    for step, (true_evol, pred_evol) in enumerate(zip(true_evolution_list, pred_evolution_list)):
-        if not true_evol and not pred_evol:
-            continue  # 跳过没有演化关系的时间步
+    for t in y_true:
+        if t not in y_pred:
+            continue
             
-        # 将预测和真实的演化关系转换为集合以便比较
-        true_set = set([(t[0], t[1]) for t in true_evol])
-        pred_set = set([(p[0], p[1]) for p in pred_evol])
+        # 初始化当前时间步的跟踪变量
+        curr_true_evol = set()
+        curr_pred_evol = set()
         
-        # 计算各项指标
-        if true_set or pred_set:  # 确保至少有一个不为空
-            valid_steps += 1
+        # 添加真实的演化关系
+        for relation in y_true[t]:
+            if len(relation) == 3:  # 新格式: (prev_idx, curr_idx, evolution_type)
+                prev_idx, curr_idx, evol_type = relation
+            else:  # 旧格式: (prev_idx, curr_idx)
+                prev_idx, curr_idx = relation
+                evol_type = 'continue'  # 默认为继续类型
+                
+            curr_true_evol.add((prev_idx, curr_idx))
+            total_true += 1
+            type_statistics[evol_type]['true'] += 1
             
-            # 交集和并集
-            intersection = true_set.intersection(pred_set)
-            union = true_set.union(pred_set)
-            
-            # 准确率：正确预测的演化关系数量除以总数
-            if union:
-                accuracy = len(intersection) / len(union)
+        # 处理预测的演化关系
+        for relation in y_pred[t]:
+            if len(relation) == 4:  # 新格式: (prev_idx, curr_idx, prob, evolution_type)
+                prev_idx, curr_idx, prob, evol_type = relation
+            elif len(relation) == 3:  # 旧格式: (prev_idx, curr_idx, prob)
+                prev_idx, curr_idx, prob = relation
+                evol_type = 'continue'  # 默认为继续类型
             else:
-                accuracy = 1.0  # 如果两者都为空，则认为完全正确
+                continue
                 
-            # 精确率：正确预测的演化关系数量除以预测的演化关系总数
-            if pred_set:
-                precision = len(intersection) / len(pred_set)
-            else:
-                precision = 0.0 if true_set else 1.0
+            # 添加到总体评估数据
+            labels.append(1 if (prev_idx, curr_idx) in curr_true_evol else 0)
+            scores.append(prob)
+            pred = 1 if prob >= threshold else 0
+            predictions.append(pred)
+            
+            # 添加到类型特定的评估数据
+            type_labels[evol_type].append(1 if (prev_idx, curr_idx) in curr_true_evol else 0)
+            type_scores[evol_type].append(prob)
+            type_predictions[evol_type].append(pred)
+            
+            # 统计预测和正确数量
+            if pred == 1:
+                curr_pred_evol.add((prev_idx, curr_idx))
+                total_pred += 1
+                type_statistics[evol_type]['pred'] += 1
                 
-            # 召回率：正确预测的演化关系数量除以真实的演化关系总数
-            if true_set:
-                recall = len(intersection) / len(true_set)
-            else:
-                recall = 1.0 if not pred_set else 0.0
-                
-            # F1值：精确率和召回率的调和平均
-            if precision + recall > 0:
-                f1 = 2 * precision * recall / (precision + recall)
-            else:
-                f1 = 0.0
-                
-            # 记录当前时间步的指标
-            step_metrics.append({
-                'step': step,
-                'accuracy': accuracy,
-                'precision': precision,
-                'recall': recall,
-                'f1': f1,
-                'true_count': len(true_set),
-                'pred_count': len(pred_set),
-                'correct_count': len(intersection)
-            })
-                
-            # 累加指标
-            total_accuracy += accuracy
-            total_precision += precision
-            total_recall += recall
-            total_f1 += f1
+                if (prev_idx, curr_idx) in curr_true_evol:
+                    total_correct += 1
+                    type_statistics[evol_type]['correct'] += 1
     
-    # 计算平均指标
-    if valid_steps > 0:
-        avg_metrics = {
-            'evolution_accuracy': total_accuracy / valid_steps,
-            'evolution_precision': total_precision / valid_steps,
-            'evolution_recall': total_recall / valid_steps,
-            'evolution_f1': total_f1 / valid_steps
-        }
+    # 计算总体评估指标
+    results = {}
+    
+    if len(labels) > 0:
+        # 总体准确率
+        results['accuracy'] = accuracy_score(labels, predictions)
         
-        # 打印详细的时间步指标
-        if verbose and step_metrics:
-            # 找出F1最好和最差的时间步
-            best_step = max(step_metrics, key=lambda x: x['f1'])
-            worst_step = min(step_metrics, key=lambda x: x['f1'])
-            
-            print(f"[团演化分析] 最佳时间步 {best_step['step']}: F1 = {best_step['f1']:.4f}, 真实数 = {best_step['true_count']}, 预测数 = {best_step['pred_count']}, 正确数 = {best_step['correct_count']}")
-            print(f"[团演化分析] 最差时间步 {worst_step['step']}: F1 = {worst_step['f1']:.4f}, 真实数 = {worst_step['true_count']}, 预测数 = {worst_step['pred_count']}, 正确数 = {worst_step['correct_count']}")
-            
-            # 计算性能统计
-            f1_values = [m['f1'] for m in step_metrics]
-            print(f"[团演化分析] F1分数统计: 平均 = {np.mean(f1_values):.4f}, 中位数 = {np.median(f1_values):.4f}, 最小 = {np.min(f1_values):.4f}, 最大 = {np.max(f1_values):.4f}")
+        # 如果有阳性预测，计算精确度、召回率和F1
+        if sum(predictions) > 0 and sum(labels) > 0:
+            results['precision'] = precision_score(labels, predictions)
+            results['recall'] = recall_score(labels, predictions)
+            results['f1'] = f1_score(labels, predictions)
+        else:
+            results['precision'] = 0.0
+            results['recall'] = 0.0
+            results['f1'] = 0.0
         
-        return avg_metrics
+        # 计算AP和AUC（如果有正样本和负样本）
+        unique_labels = np.unique(labels)
+        if len(unique_labels) > 1:  # 确保有正样本和负样本
+            results['ap'] = average_precision_score(labels, scores)
+            results['auc'] = roc_auc_score(labels, scores)
+        else:
+            results['ap'] = 0.0
+            results['auc'] = 0.0
     else:
-        if verbose:
-            print("[警告] 团演化评估: 没有有效的评估时间步")
-        return {
-            'evolution_accuracy': 0.0,
-            'evolution_precision': 0.0,
-            'evolution_recall': 0.0,
-            'evolution_f1': 0.0
+        # 如果没有标签，所有指标都是0
+        results = {
+            'accuracy': 0.0, 'precision': 0.0, 'recall': 0.0, 'f1': 0.0,
+            'ap': 0.0, 'auc': 0.0
         }
+    
+    # 添加各种演化类型的评估结果
+    for evol_type in type_labels:
+        type_results = {}
+        
+        if len(type_labels[evol_type]) > 0:
+            # 计算准确率
+            type_results['accuracy'] = accuracy_score(type_labels[evol_type], type_predictions[evol_type])
+            
+            # 如果有阳性预测，计算精确度、召回率和F1
+            if sum(type_predictions[evol_type]) > 0 and sum(type_labels[evol_type]) > 0:
+                type_results['precision'] = precision_score(type_labels[evol_type], type_predictions[evol_type])
+                type_results['recall'] = recall_score(type_labels[evol_type], type_predictions[evol_type])
+                type_results['f1'] = f1_score(type_labels[evol_type], type_predictions[evol_type])
+            else:
+                type_results['precision'] = 0.0
+                type_results['recall'] = 0.0
+                type_results['f1'] = 0.0
+            
+            # 计算AP和AUC（如果有正样本和负样本）
+            unique_type_labels = np.unique(type_labels[evol_type])
+            if len(unique_type_labels) > 1:  # 确保有正样本和负样本
+                type_results['ap'] = average_precision_score(type_labels[evol_type], type_scores[evol_type])
+                type_results['auc'] = roc_auc_score(type_labels[evol_type], type_scores[evol_type])
+            else:
+                type_results['ap'] = 0.0
+                type_results['auc'] = 0.0
+        else:
+            # 如果没有此类型的标签，所有指标都是0
+            type_results = {
+                'accuracy': 0.0, 'precision': 0.0, 'recall': 0.0, 'f1': 0.0,
+                'ap': 0.0, 'auc': 0.0
+            }
+        
+        # 将此类型的结果添加到总结果中
+        results[f'{evol_type}_accuracy'] = type_results['accuracy']
+        results[f'{evol_type}_precision'] = type_results['precision']
+        results[f'{evol_type}_recall'] = type_results['recall']
+        results[f'{evol_type}_f1'] = type_results['f1']
+        results[f'{evol_type}_ap'] = type_results['ap']
+        results[f'{evol_type}_auc'] = type_results['auc']
+    
+    # 打印详细评估信息
+    if verbose:
+        print("\n===== 团演化预测评估 =====")
+        print(f"真实演化关系总数: {total_true}")
+        print(f"预测演化关系总数: {total_pred}")
+        print(f"正确预测数: {total_correct}")
+        
+        if total_true > 0:
+            print(f"召回率: {total_correct/total_true:.4f}")
+        if total_pred > 0:
+            print(f"精确度: {total_correct/total_pred:.4f}")
+        
+        print("\n各类型演化关系统计:")
+        for evol_type, stats in type_statistics.items():
+            print(f"\n--- {evol_type.upper()} 类型 ---")
+            print(f"真实关系数: {stats['true']}")
+            print(f"预测关系数: {stats['pred']}")
+            print(f"正确预测数: {stats['correct']}")
+            
+            if stats['true'] > 0:
+                recall = stats['correct'] / stats['true']
+                print(f"召回率: {recall:.4f}")
+            else:
+                print("召回率: N/A (无真实关系)")
+                
+            if stats['pred'] > 0:
+                precision = stats['correct'] / stats['pred']
+                print(f"精确度: {precision:.4f}")
+            else:
+                print("精确度: N/A (无预测关系)")
+    
+    return results

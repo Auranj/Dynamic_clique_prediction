@@ -13,6 +13,7 @@ import os
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+from data.clique_utils import CliqueDetector
 
 def train_model():
     # 初始化数据加载器
@@ -22,7 +23,9 @@ def train_model():
         min_window=DATASET_CONFIG['min_window'],
         max_window=DATASET_CONFIG['max_window'],
         window_step=DATASET_CONFIG['window_step'],
-        adaptive_window=DATASET_CONFIG.get('adaptive_window', False)  # 支持自适应窗口
+        overlap_ratio=DATASET_CONFIG.get('overlap_ratio', 0.5),  # 新增：窗口重叠比例
+        adaptive_window=DATASET_CONFIG.get('adaptive_window', False),  # 支持自适应窗口
+        clique_detection_method=DATASET_CONFIG.get('clique_detection', {}).get('method', 'k_core')  # 新增：团检测方法
     )
     
     # 加载原始数据，计算全局统计信息
@@ -64,7 +67,7 @@ def train_model():
         print(f"- 最大窗口大小: {max(loader.adaptive_windows)} 天")
         print(f"- 窗口大小标准差: {np.std(loader.adaptive_windows):.2f} 天")
         
-        # 使用生成的图序列进行训练
+        # 使用生成的图序列进行训练，传递新的团检测配置参数
         train_data, val_data, test_data = load_bitcoin_data(
             DATASET_CONFIG['data_path'],
             loader.time_steps,  # 使用自适应窗口生成的时间步数
@@ -72,7 +75,9 @@ def train_model():
             DATASET_CONFIG['val_ratio'],
             DATASET_CONFIG['test_ratio'],
             loader=loader,
-            is_adaptive_window=True
+            is_adaptive_window=True,
+            clique_detection_method=DATASET_CONFIG.get('clique_detection', {}).get('method', 'k_core'),
+            k_value=DATASET_CONFIG.get('clique_detection', {}).get('k_value', 3)
         )
     else:
         # 搜索最优时间窗口
@@ -103,6 +108,14 @@ def train_model():
     ], lr=TRAIN_CONFIG['learning_rate'], weight_decay=TRAIN_CONFIG['weight_decay'])
     
     criterion = nn.CrossEntropyLoss()
+    
+    # 初始化团检测器，用于评估
+    clique_detector = CliqueDetector(
+        min_clique_size=DATASET_CONFIG.get('clique_detection', {}).get('min_clique_size', 3),
+        detection_method=DATASET_CONFIG.get('clique_detection', {}).get('method', 'k_core'),
+        k_value=DATASET_CONFIG.get('clique_detection', {}).get('k_value', 3),
+        min_similarity=MODEL_CONFIG.get('evolution', {}).get('similarity_threshold', 0.3)
+    )
     
     # 训练循环
     best_val_f1 = 0

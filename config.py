@@ -8,7 +8,13 @@ DATASET_CONFIG = {
     'min_window': 7,    # 最小时间窗口（天）
     'max_window': 30,   # 最大时间窗口（天）
     'window_step': 1,   # 时间窗口搜索步长（天）
-    'adaptive_window': True  # 是否使用自适应时间窗口
+    'adaptive_window': True,  # 是否使用自适应时间窗口
+    'overlap_ratio': 0.5,  # 时间窗口重叠比例，0.5表示50%重叠
+    'clique_detection': {
+        'method': 'k_core',  # 团检测方法，可选：'maximal_clique', 'k_clique_community', 'k_core', 'quasi_clique'
+        'k_value': 3,  # k值，用于k-core和k-clique-communities算法
+        'min_clique_size': 3  # 最小团大小
+    }
 }
 
 # 模型配置
@@ -41,7 +47,8 @@ MODEL_CONFIG = {
         'attention_dim': 64,   # 注意力机制的嵌入维度
         'num_heads': 4,        # 多头注意力的头数
         'dropout': 0.3,        # 注意力机制的dropout概率
-        'threshold': 0.5       # 团演化预测的概率阈值
+        'threshold': 0.5,      # 团演化预测的概率阈值
+        'similarity_threshold': 0.3  # 团演化检测的相似度阈值
     }
 }
 

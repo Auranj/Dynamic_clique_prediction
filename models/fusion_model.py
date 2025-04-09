@@ -193,18 +193,24 @@ class SNNEvolveGCN(nn.Module):
                     curr_feature = curr_clique_features_proj[i].unsqueeze(0)  # [1, attention_dim]
                     
                     # 使用多头注意力计算当前团与所有前一时间步团之间的注意力
-                    # 需要调整形状为[batch=1, seq_len=1, embed_dim]
+                    # 确保形状正确 - 修复：将形状调整为[batch=1, seq_len=1, embed_dim]
+                    # 注意力维度必须与self.attention_dim一致
                     q = curr_feature.unsqueeze(1)  # [1, 1, attention_dim]
+                    
                     # 调整prev_clique_features_proj形状为[batch=1, seq_len=num_prev_cliques, embed_dim]
                     k = prev_clique_features_proj.unsqueeze(0)  # [1, num_prev_cliques, attention_dim]
-                    v = k  # 值与键相同
+                    v = k.clone()  # 值与键相同，使用clone确保独立的内存
+                    
+                    # 检查q和k的维度，确保都是attention_dim（64）
+                    assert q.size(-1) == self.attention_dim, f"查询的嵌入维度 {q.size(-1)} 与注意力层的嵌入维度 {self.attention_dim} 不匹配"
+                    assert k.size(-1) == self.attention_dim, f"键的嵌入维度 {k.size(-1)} 与注意力层的嵌入维度 {self.attention_dim} 不匹配"
                     
                     # 应用多头注意力，得到加权后的特征
                     attn_output, attn_weights = self.evolution_attention(q, k, v)
                     
                     # 对每个前一时间步的团，计算与当前团的关联概率
                     for j in range(num_prev_cliques):
-                        # 连接当前团特征和加权后的前一时间步团特征
+                        # 连接当前团特征和前一时间步团特征
                         prev_feature = prev_clique_features_proj[j]
                         combined_feature = torch.cat([curr_feature.squeeze(0), prev_feature], dim=0)
                         
@@ -218,30 +224,44 @@ class SNNEvolveGCN(nn.Module):
                 global_prev_feature = torch.mean(prev_features, dim=0, keepdim=True)
                 global_prev_feature_proj = self.feature_projector(global_prev_feature)
                 
-                # 使用多头注意力计算当前团与全局特征之间的关联
-                q = curr_clique_features_proj.unsqueeze(0)  # [1, num_curr_cliques, attention_dim]
+                # 创建一个单一的"前一时间步全局状态"作为参考
+                # 确保shape正确 [batch=1, seq_len=1, embed_dim=attention_dim]
                 k = global_prev_feature_proj.unsqueeze(0)  # [1, 1, attention_dim]
-                v = k  # 值与键相同
+                v = k.clone()  # 值与键相同
                 
-                # 应用多头注意力
-                attn_output, _ = self.evolution_attention(q, k, v)
-                attn_output = attn_output.squeeze(0)  # [num_curr_cliques, attention_dim]
-                
-                # 计算每个当前团的演化概率
+                # 初始化演化概率列表
                 evolution_probs = []
+                
+                # 为每个当前团计算演化概率
                 for i in range(num_curr_cliques):
+                    # 当前团的投影特征 [attention_dim]
                     curr_feature = curr_clique_features_proj[i]
-                    attn_feat = attn_output[i]
                     
-                    # 连接特征
+                    # 调整形状为多头注意力的输入要求 [batch=1, seq_len=1, embed_dim]
+                    q = curr_feature.unsqueeze(0).unsqueeze(0)  # [1, 1, attention_dim]
+                    
+                    # 检查q和k的维度
+                    assert q.size(-1) == self.attention_dim, f"查询的嵌入维度 {q.size(-1)} 与注意力层的嵌入维度 {self.attention_dim} 不匹配"
+                    assert k.size(-1) == self.attention_dim, f"键的嵌入维度 {k.size(-1)} 与注意力层的嵌入维度 {self.attention_dim} 不匹配"
+                    
+                    # 应用多头注意力机制
+                    attn_output, _ = self.evolution_attention(q, k, v)
+                    
+                    # 取出注意力输出特征 [attention_dim]
+                    attn_feat = attn_output.squeeze(0).squeeze(0)  # 从[1, 1, attention_dim]到[attention_dim]
+                    
+                    # 连接当前团特征和注意力加权特征
                     combined_feature = torch.cat([curr_feature, attn_feat], dim=0)
                     
                     # 预测演化概率
                     prob = self.evolution_predictor(combined_feature.unsqueeze(0))
                     evolution_probs.append(prob)
                 
-                # 堆叠概率
-                return torch.cat(evolution_probs, dim=0)
+                # 堆叠所有概率为形状[num_curr_cliques, 1]的张量
+                if evolution_probs:
+                    return torch.cat(evolution_probs, dim=0)
+                else:
+                    return torch.zeros((num_curr_cliques, 1), device=curr_features.device)
         else:
             # 如果是第一个时间步，无法预测演化
             return torch.zeros((num_curr_cliques, 1), device=curr_features.device)

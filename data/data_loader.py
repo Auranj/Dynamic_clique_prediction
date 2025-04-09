@@ -10,7 +10,7 @@ from torch.utils.data import Dataset
 import random
 import os
 
-def load_bitcoin_data(data_path: str, time_steps: int, train_ratio: float, val_ratio: float, test_ratio: float, loader=None, is_adaptive_window=False):
+def load_bitcoin_data(data_path: str, time_steps: int, train_ratio: float, val_ratio: float, test_ratio: float, loader=None, is_adaptive_window=False, clique_detection_method='k_core', k_value=3):
     """加载并预处理Bitcoin-OTC数据集，用于团结构预测。
 
     Args:
@@ -21,13 +21,16 @@ def load_bitcoin_data(data_path: str, time_steps: int, train_ratio: float, val_r
         test_ratio: 测试集比例
         loader: 已初始化的DataLoader对象（可选）
         is_adaptive_window: 是否使用自适应窗口模式
+        clique_detection_method: 团检测方法，可选值：'maximal_clique', 'k_clique_community', 'k_core', 'quasi_clique'
+        k_value: k值，用于k-core和k-clique-communities算法
 
     Returns:
         train_data, val_data, test_data: 训练集、验证集和测试集
     """
     # 初始化数据加载器
     if loader is None:
-        loader = DataLoader(data_path, time_window=time_steps)
+        loader = DataLoader(data_path, time_window=time_steps, 
+                          clique_detection_method=clique_detection_method)
     
     # 加载数据并生成图序列
     if is_adaptive_window and hasattr(loader, 'graphs') and loader.graphs:
@@ -54,7 +57,11 @@ def load_bitcoin_data(data_path: str, time_steps: int, train_ratio: float, val_r
     
     # 初始化团检测器
     from data.clique_utils import CliqueDetector
-    clique_detector = CliqueDetector(min_clique_size=3)
+    clique_detector = CliqueDetector(
+        min_clique_size=3, 
+        detection_method=clique_detection_method,
+        k_value=k_value
+    )
     
     # 处理训练集
     prev_cliques = None
@@ -65,8 +72,8 @@ def load_bitcoin_data(data_path: str, time_steps: int, train_ratio: float, val_r
         x = torch.FloatTensor(np.array(list(features.values())))
         adj = torch.FloatTensor(adj.todense())
         
-        # 检测图中的团结构
-        cliques = clique_detector.find_maximal_cliques(graph)
+        # 检测图中的团结构，使用新的方法
+        cliques = clique_detector.find_cliques(graph)
         
         # 应用样本平衡策略，确保有足够的正负样本
         if hasattr(loader, 'ensure_balanced_samples'):
@@ -112,8 +119,8 @@ def load_bitcoin_data(data_path: str, time_steps: int, train_ratio: float, val_r
         x = torch.FloatTensor(np.array(list(features.values())))
         adj = torch.FloatTensor(adj.todense())
         
-        # 检测图中的团结构
-        cliques = clique_detector.find_maximal_cliques(graph)
+        # 检测图中的团结构，使用新的方法
+        cliques = clique_detector.find_cliques(graph)
         
         # 应用样本平衡策略，确保有足够的正负样本
         if hasattr(loader, 'ensure_balanced_samples'):
@@ -159,8 +166,8 @@ def load_bitcoin_data(data_path: str, time_steps: int, train_ratio: float, val_r
         x = torch.FloatTensor(np.array(list(features.values())))
         adj = torch.FloatTensor(adj.todense())
         
-        # 检测图中的团结构
-        cliques = clique_detector.find_maximal_cliques(graph)
+        # 检测图中的团结构，使用新的方法
+        cliques = clique_detector.find_cliques(graph)
         
         # 应用样本平衡策略，确保有足够的正负样本
         if hasattr(loader, 'ensure_balanced_samples'):
@@ -203,28 +210,35 @@ def load_bitcoin_data(data_path: str, time_steps: int, train_ratio: float, val_r
 class DataLoader:
     """数据加载器，负责加载和预处理Bitcoin-OTC数据集。"""
     
-    def __init__(self, data_path: str, time_window: int = 13, min_window: int = 7, max_window: int = 90, window_step: int = 1, adaptive_window: bool = False):
+    def __init__(self, data_path: str, time_window: int = 14, min_window: int = 7, 
+                 max_window: int = 30, window_step: int = 1, overlap_ratio: float = 0.5,
+                 adaptive_window: bool = False, clique_detection_method: str = 'k_core'):
         """初始化数据加载器。
 
         Args:
-            data_path: Bitcoin-OTC数据集的路径
-            time_window: 时间窗口大小（天），默认13天
-            min_window: 最小时间窗口大小（天）
-            max_window: 最大时间窗口大小（天），默认90天
-            window_step: 时间窗口搜索步长（天）
-            adaptive_window: 是否使用自适应时间窗口
+            data_path: 数据集路径
+            time_window: 时间窗口大小（天）
+            min_window: 最小时间窗口大小（天），用于自适应窗口
+            max_window: 最大时间窗口大小（天），用于自适应窗口
+            window_step: 时间窗口搜索步长（天），用于自适应窗口
+            overlap_ratio: 时间窗口重叠比例，范围[0,1]，0表示不重叠，1表示完全重叠
+            adaptive_window: 是否使用自适应窗口大小
+            clique_detection_method: 团检测方法，可选值：'maximal_clique', 'k_clique_community', 'k_core', 'quasi_clique'
         """
         self.data_path = data_path
         self.time_window = time_window
         self.min_window = min_window
         self.max_window = max_window
         self.window_step = window_step
+        self.overlap_ratio = overlap_ratio
         self.adaptive_window = adaptive_window
+        self.clique_detection_method = clique_detection_method
+        
         self.raw_data = None
-        self.time_steps = None
         self.graphs = []
+        self.adaptive_windows = []
+        self.time_steps = None
         self.window_performance = {}
-        self.adaptive_windows = []  # 存储每个时间步的自适应窗口大小
 
     def evaluate_window_size(self, window_size: int) -> float:
         """评估指定时间窗口大小的性能。
@@ -477,15 +491,21 @@ class DataLoader:
                 window_end = current_time + timedelta(days=window_size)
                 time_windows.append((current_time, window_end))
                 
-                # 移动到下一个时间点
-                current_time = window_end
+                # 移动到下一个时间点，考虑重叠
+                step_size = int(window_size * (1 - self.overlap_ratio))
+                step_size = max(1, step_size)  # 确保至少移动1天
+                current_time = current_time + timedelta(days=step_size)
         else:
-            # 固定窗口模式
+            # 固定窗口模式，但使用滑动窗口
             window_size = timedelta(days=self.time_window)
+            step_size = int(self.time_window * (1 - self.overlap_ratio))
+            step_size = max(1, step_size)  # 确保至少移动1天
+            step_delta = timedelta(days=step_size)
+            
             while current_time < end_time:
                 window_end = current_time + window_size
                 time_windows.append((current_time, window_end))
-                current_time = window_end
+                current_time = current_time + step_delta
         
         self.time_steps = len(time_windows)
         return time_windows
