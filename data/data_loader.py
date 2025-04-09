@@ -10,8 +10,8 @@ from torch.utils.data import Dataset
 import random
 import os
 
-def load_bitcoin_data(data_path: str, time_steps: int, train_ratio: float, val_ratio: float, test_ratio: float, loader=None, is_adaptive_window=False, clique_detection_method='k_core', k_value=3):
-    """加载并预处理Bitcoin-OTC数据集，用于团结构预测。
+def load_bitcoin_data(data_path: str, time_steps: int, train_ratio: float, val_ratio: float, test_ratio: float, loader=None, is_adaptive_window=False):
+    """加载并预处理Bitcoin-OTC数据集，用于节点分类任务。
 
     Args:
         data_path: 数据集路径
@@ -21,16 +21,13 @@ def load_bitcoin_data(data_path: str, time_steps: int, train_ratio: float, val_r
         test_ratio: 测试集比例
         loader: 已初始化的DataLoader对象（可选）
         is_adaptive_window: 是否使用自适应窗口模式
-        clique_detection_method: 团检测方法，可选值：'maximal_clique', 'k_clique_community', 'k_core', 'quasi_clique'
-        k_value: k值，用于k-core和k-clique-communities算法
 
     Returns:
         train_data, val_data, test_data: 训练集、验证集和测试集
     """
     # 初始化数据加载器
     if loader is None:
-        loader = DataLoader(data_path, time_window=time_steps, 
-                          clique_detection_method=clique_detection_method)
+        loader = DataLoader(data_path, time_window=time_steps)
     
     # 加载数据并生成图序列
     if is_adaptive_window and hasattr(loader, 'graphs') and loader.graphs:
@@ -55,154 +52,82 @@ def load_bitcoin_data(data_path: str, time_steps: int, train_ratio: float, val_r
     val_data = []
     test_data = []
     
-    # 初始化团检测器
-    from data.clique_utils import CliqueDetector
-    clique_detector = CliqueDetector(
-        min_clique_size=3, 
-        detection_method=clique_detection_method,
-        k_value=k_value
-    )
-    
     # 处理训练集
-    prev_cliques = None
     for i, graph in enumerate(train_graphs):
         features = loader.get_node_features(graph)
         adj = nx.adjacency_matrix(graph)
+        
         # 转换为PyTorch张量
         x = torch.FloatTensor(np.array(list(features.values())))
         adj = torch.FloatTensor(adj.todense())
         
-        # 检测图中的团结构，使用新的方法
-        cliques = clique_detector.find_cliques(graph)
-        
-        # 应用样本平衡策略，确保有足够的正负样本
-        if hasattr(loader, 'ensure_balanced_samples'):
-            cliques = loader.ensure_balanced_samples(graph, cliques)
-        
-        # 为每个节点生成团标签
-        node_to_cliques = clique_detector.label_clique_nodes(graph, cliques)
-        
-        # 生成节点的团成员标签（二分类：节点是否属于任何团）
+        # 生成节点标签（根据节点度数设定标签）
+        # 高度中心性的节点（度数较高）标记为类别1，其他节点标记为类别0
         node_labels = []
-        clique_nodes = []
+        degrees = dict(graph.degree())
+        median_degree = np.median(list(degrees.values()))
+        
         for node in graph.nodes():
-            # 如果节点属于任何团，标签为1，否则为0
-            is_in_clique = 1 if node_to_cliques[node] else 0
-            node_labels.append(is_in_clique)
-            if is_in_clique:
-                clique_nodes.append(node)
-        
-        # 如果有前一时间步的团，计算团的演化关系
-        clique_evolution = None
-        if prev_cliques is not None and cliques:
-            clique_evolution = clique_detector.get_clique_evolution(prev_cliques, cliques)
-        
-        # 更新前一时间步的团
-        prev_cliques = cliques
+            # 如果节点度数高于中位数，标签为1，否则为0
+            is_high_degree = 1 if degrees[node] > median_degree else 0
+            node_labels.append(is_high_degree)
         
         labels = torch.LongTensor(node_labels)
         train_data.append({
             'features': x,
             'adj': adj,
             'labels': labels,
-            'graph': graph,  # 保存原始图以便可视化
-            'cliques': cliques,  # 保存检测到的团
-            'clique_nodes': clique_nodes,  # 保存属于团的节点
-            'clique_evolution': clique_evolution  # 保存团的演化关系
+            'graph': graph  # 保存原始图以便可视化
         })
     
     # 处理验证集
-    prev_cliques = None
     for i, graph in enumerate(val_graphs):
         features = loader.get_node_features(graph)
         adj = nx.adjacency_matrix(graph)
         x = torch.FloatTensor(np.array(list(features.values())))
         adj = torch.FloatTensor(adj.todense())
         
-        # 检测图中的团结构，使用新的方法
-        cliques = clique_detector.find_cliques(graph)
-        
-        # 应用样本平衡策略，确保有足够的正负样本
-        if hasattr(loader, 'ensure_balanced_samples'):
-            cliques = loader.ensure_balanced_samples(graph, cliques)
-        
-        # 为每个节点生成团标签
-        node_to_cliques = clique_detector.label_clique_nodes(graph, cliques)
-        
-        # 生成节点的团成员标签（二分类：节点是否属于任何团）
+        # 生成节点标签（根据节点度数设定标签）
         node_labels = []
-        clique_nodes = []
+        degrees = dict(graph.degree())
+        median_degree = np.median(list(degrees.values()))
+        
         for node in graph.nodes():
-            # 如果节点属于任何团，标签为1，否则为0
-            is_in_clique = 1 if node_to_cliques[node] else 0
-            node_labels.append(is_in_clique)
-            if is_in_clique:
-                clique_nodes.append(node)
-        
-        # 如果有前一时间步的团，计算团的演化关系
-        clique_evolution = None
-        if prev_cliques is not None and cliques:
-            clique_evolution = clique_detector.get_clique_evolution(prev_cliques, cliques)
-        
-        # 更新前一时间步的团
-        prev_cliques = cliques
+            # 如果节点度数高于中位数，标签为1，否则为0
+            is_high_degree = 1 if degrees[node] > median_degree else 0
+            node_labels.append(is_high_degree)
         
         labels = torch.LongTensor(node_labels)
         val_data.append({
             'features': x,
             'adj': adj,
             'labels': labels,
-            'graph': graph,  # 保存原始图以便可视化
-            'cliques': cliques,  # 保存检测到的团
-            'clique_nodes': clique_nodes,  # 保存属于团的节点
-            'clique_evolution': clique_evolution  # 保存团的演化关系
+            'graph': graph  # 保存原始图以便可视化
         })
     
     # 处理测试集
-    prev_cliques = None
     for i, graph in enumerate(test_graphs):
         features = loader.get_node_features(graph)
         adj = nx.adjacency_matrix(graph)
         x = torch.FloatTensor(np.array(list(features.values())))
         adj = torch.FloatTensor(adj.todense())
         
-        # 检测图中的团结构，使用新的方法
-        cliques = clique_detector.find_cliques(graph)
-        
-        # 应用样本平衡策略，确保有足够的正负样本
-        if hasattr(loader, 'ensure_balanced_samples'):
-            cliques = loader.ensure_balanced_samples(graph, cliques)
-        
-        # 为每个节点生成团标签
-        node_to_cliques = clique_detector.label_clique_nodes(graph, cliques)
-        
-        # 生成节点的团成员标签（二分类：节点是否属于任何团）
+        # 生成节点标签（根据节点度数设定标签）
         node_labels = []
-        clique_nodes = []
+        degrees = dict(graph.degree())
+        median_degree = np.median(list(degrees.values()))
+        
         for node in graph.nodes():
-            # 如果节点属于任何团，标签为1，否则为0
-            is_in_clique = 1 if node_to_cliques[node] else 0
-            node_labels.append(is_in_clique)
-            if is_in_clique:
-                clique_nodes.append(node)
-        
-        # 如果有前一时间步的团，计算团的演化关系
-        clique_evolution = None
-        if prev_cliques is not None and cliques:
-            clique_evolution = clique_detector.get_clique_evolution(prev_cliques, cliques)
-        
-        # 更新前一时间步的团
-        prev_cliques = cliques
+            # 如果节点度数高于中位数，标签为1，否则为0
+            is_high_degree = 1 if degrees[node] > median_degree else 0
+            node_labels.append(is_high_degree)
         
         labels = torch.LongTensor(node_labels)
         test_data.append({
             'features': x,
             'adj': adj,
             'labels': labels,
-            'graph': graph,  # 保存原始图以便可视化
-            'cliques': cliques,  # 保存检测到的团
-            'clique_nodes': clique_nodes,  # 保存属于团的节点
-            'clique_evolution': clique_evolution  # 保存团的演化关系
+            'graph': graph  # 保存原始图以便可视化
         })
     
     return train_data, val_data, test_data
@@ -212,7 +137,7 @@ class DataLoader:
     
     def __init__(self, data_path: str, time_window: int = 14, min_window: int = 7, 
                  max_window: int = 30, window_step: int = 1, overlap_ratio: float = 0.5,
-                 adaptive_window: bool = False, clique_detection_method: str = 'k_core'):
+                 adaptive_window: bool = False):
         """初始化数据加载器。
 
         Args:
@@ -223,7 +148,6 @@ class DataLoader:
             window_step: 时间窗口搜索步长（天），用于自适应窗口
             overlap_ratio: 时间窗口重叠比例，范围[0,1]，0表示不重叠，1表示完全重叠
             adaptive_window: 是否使用自适应窗口大小
-            clique_detection_method: 团检测方法，可选值：'maximal_clique', 'k_clique_community', 'k_core', 'quasi_clique'
         """
         self.data_path = data_path
         self.time_window = time_window
@@ -232,7 +156,6 @@ class DataLoader:
         self.window_step = window_step
         self.overlap_ratio = overlap_ratio
         self.adaptive_window = adaptive_window
-        self.clique_detection_method = clique_detection_method
         
         self.raw_data = None
         self.graphs = []

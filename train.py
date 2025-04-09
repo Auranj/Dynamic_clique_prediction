@@ -1,12 +1,13 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import DataLoader
 from data.data_loader import DataLoader, load_bitcoin_data
 from models.snn import SimplexNeuralNetwork as SNN
 from models.evolvegcn import EvolveGCN
 from models.fusion_model import SNNEvolveGCN as FusionModel
-from utils.evaluation import evaluate_temporal_prediction, evaluate_clique_prediction, evaluate_clique_evolution
+from utils.evaluation import evaluate_temporal_prediction
 from utils.visualization import plot_metrics_over_time
 from config import DATASET_CONFIG, MODEL_CONFIG, TRAIN_CONFIG
 import os
@@ -24,8 +25,7 @@ def train_model():
         max_window=DATASET_CONFIG['max_window'],
         window_step=DATASET_CONFIG['window_step'],
         overlap_ratio=DATASET_CONFIG.get('overlap_ratio', 0.5),  # 新增：窗口重叠比例
-        adaptive_window=DATASET_CONFIG.get('adaptive_window', False),  # 支持自适应窗口
-        clique_detection_method=DATASET_CONFIG.get('clique_detection', {}).get('method', 'k_core')  # 新增：团检测方法
+        adaptive_window=DATASET_CONFIG.get('adaptive_window', False)  # 支持自适应窗口
     )
     
     # 加载原始数据，计算全局统计信息
@@ -67,7 +67,7 @@ def train_model():
         print(f"- 最大窗口大小: {max(loader.adaptive_windows)} 天")
         print(f"- 窗口大小标准差: {np.std(loader.adaptive_windows):.2f} 天")
         
-        # 使用生成的图序列进行训练，传递新的团检测配置参数
+        # 使用生成的图序列进行训练
         train_data, val_data, test_data = load_bitcoin_data(
             DATASET_CONFIG['data_path'],
             loader.time_steps,  # 使用自适应窗口生成的时间步数
@@ -75,9 +75,7 @@ def train_model():
             DATASET_CONFIG['val_ratio'],
             DATASET_CONFIG['test_ratio'],
             loader=loader,
-            is_adaptive_window=True,
-            clique_detection_method=DATASET_CONFIG.get('clique_detection', {}).get('method', 'k_core'),
-            k_value=DATASET_CONFIG.get('clique_detection', {}).get('k_value', 3)
+            is_adaptive_window=True
         )
     else:
         # 搜索最优时间窗口
@@ -100,25 +98,77 @@ def train_model():
     evolvegcn = EvolveGCN(**MODEL_CONFIG['evolvegcn']).to(device)
     fusion_model = FusionModel(**MODEL_CONFIG['fusion']).to(device)
     
-    # 定义优化器和损失函数
+    # 分析各时间步的类别分布
+    print("\n类别分布分析:")
+    class_counts = {}
+    for t in range(len(train_data)):
+        batch = train_data[t]
+        y_numpy = batch['labels'].numpy()  # 在移动到GPU前获取numpy数组
+        positive_count = np.sum(y_numpy == 1)
+        negative_count = np.sum(y_numpy == 0)
+        total_count = len(y_numpy)
+        class_ratio = positive_count / total_count if total_count > 0 else 0
+        
+        class_counts[t] = {
+            'positive': positive_count,
+            'negative': negative_count,
+            'total': total_count,
+            'positive_ratio': class_ratio
+        }
+        
+        print(f"时间步 {t}: 正样本 {positive_count}, 负样本 {negative_count}, "
+              f"正样本比例 {class_ratio:.2f}")
+    
+    # 计算全局类别权重用于损失函数
+    all_labels = []
+    for t in range(len(train_data)):
+        all_labels.extend(train_data[t]['labels'].numpy())
+    
+    all_labels = np.array(all_labels)
+    positive_weight = 1.0
+    negative_weight = 1.0
+    
+    # 根据类别比例计算权重
+    if len(all_labels) > 0:
+        positive_count = np.sum(all_labels == 1)
+        negative_count = np.sum(all_labels == 0)
+        total_count = len(all_labels)
+        
+        if positive_count > 0 and negative_count > 0:
+            # 计算反比权重
+            positive_weight = total_count / (2 * positive_count)
+            negative_weight = total_count / (2 * negative_count)
+    
+    # 防止权重过大导致训练不稳定
+    max_weight = 10.0
+    positive_weight = min(positive_weight, max_weight)
+    negative_weight = min(negative_weight, max_weight)
+    
+    print(f"\n类别权重: 正样本 {positive_weight:.2f}, 负样本 {negative_weight:.2f}")
+    
+    # 创建类别权重张量
+    class_weights = torch.tensor([negative_weight, positive_weight], device=device, dtype=torch.float32)
+    
+    # 定义带权重的交叉熵损失函数
+    criterion = nn.CrossEntropyLoss(weight=class_weights)
+    
+    # 定义优化器和学习率调度器
     optimizer = optim.Adam([
         {'params': snn.parameters()},
         {'params': evolvegcn.parameters()},
         {'params': fusion_model.parameters()}
     ], lr=TRAIN_CONFIG['learning_rate'], weight_decay=TRAIN_CONFIG['weight_decay'])
     
-    criterion = nn.CrossEntropyLoss()
-    
-    # 初始化团检测器，用于评估
-    clique_detector = CliqueDetector(
-        min_clique_size=DATASET_CONFIG.get('clique_detection', {}).get('min_clique_size', 3),
-        detection_method=DATASET_CONFIG.get('clique_detection', {}).get('method', 'k_core'),
-        k_value=DATASET_CONFIG.get('clique_detection', {}).get('k_value', 3),
-        min_similarity=MODEL_CONFIG.get('evolution', {}).get('similarity_threshold', 0.3)
+    # 学习率调度器，使用余弦退火策略
+    lr_scheduler = optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, 
+        T_max=TRAIN_CONFIG['num_epochs'],
+        eta_min=TRAIN_CONFIG['learning_rate'] * 0.01
     )
     
     # 训练循环
     best_val_f1 = 0
+    best_val_auc = 0
     patience_counter = 0
     train_metrics_history = []
     val_metrics_history = []
@@ -133,15 +183,22 @@ def train_model():
         train_true_list = []
         train_score_list = []
         
-        # 团演化预测评估
-        train_clique_evolution_true = []
-        train_clique_evolution_pred = []
+        epoch_loss = 0.0
         
-        prev_features = None
         for t in range(len(train_data)):
             batch = train_data[t]
             x, adj, y = batch['features'], batch['adj'], batch['labels']
-            x, adj, y = x.to(device), adj.to(device), y.to(device)
+            x = x.to(device).float()
+            adj = adj.to(device).float()
+            y = y.to(device).long()
+            
+            # 应用标签平滑
+            if TRAIN_CONFIG.get('label_smoothing', False):
+                smoothing_factor = 0.1
+                # 将硬标签转换为软标签
+                y_smooth = torch.zeros(y.size(0), 2, device=device)
+                y_smooth.fill_(smoothing_factor / 2)  # 平滑分布
+                y_smooth.scatter_(1, y.unsqueeze(1), 1.0 - smoothing_factor)  # 主要类别仍有较高概率
             
             # 前向传播
             up_adj = adj.clone()
@@ -153,99 +210,44 @@ def train_model():
             combined_features = torch.cat([snn_out, evolvegcn_out], dim=1)
             outputs = fusion_model(combined_features)
             
-            # 计算节点级别的团成员预测损失
-            node_loss = criterion(outputs, y)
-            
-            # 团演化预测损失
-            evolution_loss = 0.0
-            if batch['cliques'] and t > 0 and batch['clique_evolution'] is not None:
-                # 将团列表从集合转换为列表
-                curr_cliques = [list(clique) for clique in batch['cliques']]
-                
-                # 获取前一时间步的团列表(如果有)
-                prev_cliques = None
-                if t > 0 and train_data[t-1]['cliques']:
-                    prev_cliques = [list(clique) for clique in train_data[t-1]['cliques']]
-                
-                # 预测团的演化，传入前一时间步的团列表
-                evolution_prob = fusion_model.predict_evolution(
-                    x, curr_cliques, prev_features, prev_cliques)
-                
-                # 如果提供了前一时间步的团列表，evolution_prob是一个矩阵，需要特殊处理
-                if prev_cliques and len(prev_cliques) > 0:
-                    # 创建团演化的真实标签矩阵: [num_curr_cliques, num_prev_cliques]
-                    num_curr_cliques = len(curr_cliques)
-                    num_prev_cliques = len(prev_cliques)
-                    
-                    # 初始化全零矩阵
-                    true_evolution_matrix = torch.zeros(
-                        (num_curr_cliques, num_prev_cliques), device=device)
-                    
-                    # 填充真实标签
-                    for prev_idx, curr_idx in batch['clique_evolution']:
-                        if curr_idx < num_curr_cliques and prev_idx < num_prev_cliques:
-                            true_evolution_matrix[curr_idx, prev_idx] = 1.0
-                    
-                    # 计算二元交叉熵损失
-                    evolution_criterion = nn.BCELoss()
-                    evolution_loss = evolution_criterion(evolution_prob, true_evolution_matrix)
-                    
-                    # 收集团演化预测结果
-                    pred_evolution = []
-                    for i in range(evolution_prob.size(0)):
-                        max_prob_idx = torch.argmax(evolution_prob[i]).item()
-                        if evolution_prob[i, max_prob_idx].item() > 0.5:  # 使用0.5作为阈值
-                            pred_evolution.append((max_prob_idx, i))
-                else:
-                    # 创建真实的演化标签向量
-                    true_evolution = torch.zeros(len(curr_cliques), device=device)
-                    for prev_idx, curr_idx in batch['clique_evolution']:
-                        if curr_idx < len(curr_cliques):
-                            true_evolution[curr_idx] = 1.0
-                    
-                    # 计算二元交叉熵损失
-                    if len(evolution_prob) > 0 and len(true_evolution) > 0:
-                        evolution_criterion = nn.BCELoss()
-                        # 确保维度匹配
-                        if evolution_prob.dim() == 2:  # 如果是二维张量[num_cliques, 1]
-                            evolution_loss = evolution_criterion(evolution_prob.squeeze(1), true_evolution)
-                        else:
-                            evolution_loss = evolution_criterion(evolution_prob, true_evolution)
-                        
-                        # 收集团演化预测结果
-                        pred_evolution = []
-                        for i, prob in enumerate(evolution_prob):
-                            if prob[0].item() > 0.5:  # 使用0.5作为阈值
-                                # 简化处理，假设与前一时间步的第一个团有关联
-                                pred_evolution.append((0, i))
-                
-                # 添加调试信息
-                print(f"[训练 调试] 时间步 {t}: 真实团演化关系数量: {len(batch['clique_evolution'])}, 预测团演化关系数量: {len(pred_evolution)}")
-                train_clique_evolution_true.append(batch['clique_evolution'])
-                train_clique_evolution_pred.append(pred_evolution)
-            
-            # 总损失 = 节点级别损失 * 节点权重 + 团演化损失 * 演化权重
-            node_loss_weight = TRAIN_CONFIG['loss_weights']['node_loss_weight']
-            evolution_loss_weight = TRAIN_CONFIG['loss_weights']['evolution_loss_weight']
-            
-            if evolution_loss > 0:
-                loss = node_loss * node_loss_weight + evolution_loss * evolution_loss_weight
+            # 计算节点级别的分类损失
+            if TRAIN_CONFIG.get('label_smoothing', False):
+                # 使用KL散度损失
+                loss = -torch.sum(y_smooth * F.log_softmax(outputs, dim=1), dim=1).mean()
             else:
-                loss = node_loss
+                loss = criterion(outputs, y)
+            
+            # L2正则化项
+            l2_lambda = TRAIN_CONFIG.get('l2_lambda', 0.001)
+            l2_reg = torch.tensor(0., device=device, dtype=torch.float32)
+            for param in snn.parameters():
+                l2_reg += torch.norm(param, p=2)
+            for param in evolvegcn.parameters():
+                l2_reg += torch.norm(param, p=2)
+            for param in fusion_model.parameters():
+                l2_reg += torch.norm(param, p=2)
+            
+            loss += l2_lambda * l2_reg
             
             # 反向传播和优化
             optimizer.zero_grad()
             loss.backward()
+            
+            # 梯度裁剪
+            max_grad_norm = TRAIN_CONFIG.get('max_grad_norm', 1.0)
+            torch.nn.utils.clip_grad_norm_(snn.parameters(), max_grad_norm)
+            torch.nn.utils.clip_grad_norm_(evolvegcn.parameters(), max_grad_norm)
+            torch.nn.utils.clip_grad_norm_(fusion_model.parameters(), max_grad_norm)
+            
             optimizer.step()
+            
+            epoch_loss += loss.item()
             
             # 收集预测结果
             _, preds = torch.max(outputs, 1)
             train_pred_list.append(preds.cpu().numpy())
             train_true_list.append(y.cpu().numpy())
-            train_score_list.append(outputs[:, 1].detach().cpu().numpy())
-            
-            # 更新前一时间步的特征
-            prev_features = x.clone()
+            train_score_list.append(F.softmax(outputs, dim=1)[:, 1].detach().cpu().numpy())
         
         # 计算训练指标
         train_metrics = evaluate_temporal_prediction(
@@ -261,16 +263,13 @@ def train_model():
         val_true_list = []
         val_score_list = []
         
-        # 团演化预测评估
-        clique_evolution_true = []
-        clique_evolution_pred = []
-        
         with torch.no_grad():
-            prev_features = None
             for t in range(len(val_data)):
                 batch = val_data[t]
                 x, adj, y = batch['features'], batch['adj'], batch['labels']
-                x, adj, y = x.to(device), adj.to(device), y.to(device)
+                x = x.to(device).float()
+                adj = adj.to(device).float()
+                y = y.to(device).long()
                 
                 up_adj = adj.clone()
                 down_adj = adj.clone()
@@ -279,142 +278,40 @@ def train_model():
                 combined_features = torch.cat([snn_out, evolvegcn_out], dim=1)
                 outputs = fusion_model(combined_features)
                 
-                # 节点级别的团成员预测
+                # 节点级别的分类
                 _, preds = torch.max(outputs, 1)
                 val_pred_list.append(preds.cpu().numpy())
                 val_true_list.append(y.cpu().numpy())
-                val_score_list.append(outputs[:, 1].detach().cpu().numpy())
-                
-                # 团演化预测
-                if batch['cliques'] and t > 0:  # 确保有团且不是第一个时间步
-                    # 将团列表从集合转换为列表
-                    curr_cliques = [list(clique) for clique in batch['cliques']]
-                    
-                    # 获取前一时间步的团列表(如果有)
-                    prev_cliques = None
-                    if t > 0 and val_data[t-1]['cliques']:
-                        prev_cliques = [list(clique) for clique in val_data[t-1]['cliques']]
-                    
-                    # 预测团的演化，传入前一时间步的团列表
-                    evolution_prob = fusion_model.predict_evolution(
-                        x, curr_cliques, prev_features, prev_cliques)
-                    
-                    # 如果有真实的团演化数据，收集评估数据
-                    if batch['clique_evolution'] is not None:
-                        # 真实的团演化关系
-                        true_evolution = batch['clique_evolution']
-                        
-                        # 根据概率预测团演化关系
-                        pred_evolution = []
-                        
-                        # 如果提供了前一时间步的团列表，evolution_prob是一个矩阵
-                        if prev_cliques and len(prev_cliques) > 0:
-                            # 对每个当前团，找到与之关联概率最高的前一时间步团
-                            for i in range(evolution_prob.size(0)):
-                                max_prob_idx = torch.argmax(evolution_prob[i]).item()
-                                if evolution_prob[i, max_prob_idx].item() > 0.5:  # 使用0.5作为阈值
-                                    pred_evolution.append((max_prob_idx, i))
-                        else:
-                            # 否则，使用全局判断
-                            for i, prob in enumerate(evolution_prob):
-                                if prob[0].item() > 0.5:  # 使用0.5作为阈值
-                                    # 简化处理：假设与前一时间步的第一个团有关联
-                                    pred_evolution.append((0, i))
-                        
-                        # 调试信息
-                        print(f"[调试] 时间步 {t}: 真实团演化关系数量: {len(true_evolution)}, 预测团演化关系数量: {len(pred_evolution)}")
-                        
-                        # 添加到评估列表
-                        clique_evolution_true.append(true_evolution)
-                        clique_evolution_pred.append(pred_evolution)
-                
-                # 更新前一时间步的特征
-                prev_features = x.clone()
+                val_score_list.append(F.softmax(outputs, dim=1)[:, 1].detach().cpu().numpy())
         
         # 计算验证指标
         val_metrics = evaluate_temporal_prediction(
             val_true_list, val_pred_list, val_score_list)
         val_metrics_history.append(val_metrics)
         
-        # 评估团演化预测
-        if clique_evolution_true and clique_evolution_pred:
-            # 使用新的评估函数计算详细指标，并显式处理异常
-            try:
-                # 确保传入的数据不为空
-                if all(len(data) > 0 for data in clique_evolution_true if data is not None) and \
-                   all(len(data) > 0 for data in clique_evolution_pred if data is not None):
-                    evolution_metrics = evaluate_clique_evolution(
-                        clique_evolution_true, 
-                        clique_evolution_pred,
-                        verbose=True  # 启用详细输出以便调试
-                    )
-                    
-                    print(f'团演化预测指标:')
-                    # 加入检查确保键存在
-                    if 'accuracy' in evolution_metrics:
-                        print(f'  - 准确率: {evolution_metrics.get("accuracy", 0.0):.4f}')
-                    if 'precision' in evolution_metrics:
-                        print(f'  - 精确率: {evolution_metrics.get("precision", 0.0):.4f}')
-                    if 'recall' in evolution_metrics:
-                        print(f'  - 召回率: {evolution_metrics.get("recall", 0.0):.4f}')
-                    if 'f1' in evolution_metrics:
-                        print(f'  - F1值: {evolution_metrics.get("f1", 0.0):.4f}')
-                    
-                    # 为了兼容性，确保必要的键存在
-                    evolution_metrics.setdefault('evolution_accuracy', evolution_metrics.get('accuracy', 0.0))
-                    evolution_metrics.setdefault('evolution_precision', evolution_metrics.get('precision', 0.0))
-                    evolution_metrics.setdefault('evolution_recall', evolution_metrics.get('recall', 0.0))
-                    evolution_metrics.setdefault('evolution_f1', evolution_metrics.get('f1', 0.0))
-                    
-                    # 将团演化预测指标添加到验证指标中
-                    val_metrics.update(evolution_metrics)
-                else:
-                    print("警告: 部分演化预测数据为空，跳过团演化评估")
-            except Exception as e:
-                print(f"评估团演化预测时出错: {str(e)}")
-                import traceback
-                traceback.print_exc()
+        # 更新学习率
+        lr_scheduler.step()
         
-        # 早停检查
-        if 'evolution_f1' in val_metrics and val_metrics['evolution_f1'] > best_val_f1:
-            best_val_f1 = val_metrics['evolution_f1']
-            patience_counter = 0
-            
-            print(f"[信息] 保存新的最佳模型，团演化F1: {best_val_f1:.4f}")
-            
-            # 保存最佳模型
-            if not os.path.exists('checkpoints'):
-                os.makedirs('checkpoints')
-            
-            torch.save({
-                'snn_state_dict': snn.state_dict(),
-                'evolvegcn_state_dict': evolvegcn.state_dict(),
-                'fusion_model_state_dict': fusion_model.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'epoch': epoch,
-                'best_val_f1': best_val_f1
-            }, os.path.join('checkpoints', 'best_model.pth'))
-            
-            # 保存训练和验证指标图表
-            if not os.path.exists('train_results'):
-                os.makedirs('train_results')
-            
-            # 绘制训练指标图表
-            plot_metrics_over_time(
-                train_metrics_history,
-                save_path=os.path.join('train_results', 'train_metrics.png')
-            )
-            
-            # 绘制验证指标图表
-            plot_metrics_over_time(
-                val_metrics_history,
-                save_path=os.path.join('train_results', 'val_metrics.png')
-            )
-        elif val_metrics['f1'] > best_val_f1 and 'evolution_f1' not in val_metrics:
-            # 如果没有团演化指标，则回退到使用节点F1值
+        # 判断是否保存当前模型
+        save_model = False
+        
+        # 使用F1作为主要评估指标
+        if val_metrics['f1'] > best_val_f1:
             best_val_f1 = val_metrics['f1']
             patience_counter = 0
+            save_model = True
+            print(f"[信息] 保存新的最佳F1模型，F1: {best_val_f1:.4f}")
             
+        # 同时监控AUC值
+        if 'auc' in val_metrics and val_metrics['auc'] > best_val_auc:
+            best_val_auc = val_metrics['auc']
+            # 如果F1没有提升，但AUC提升了，也保存模型
+            if not save_model:
+                save_model = True
+                patience_counter = 0
+                print(f"[信息] 保存新的最佳AUC模型，AUC: {best_val_auc:.4f}")
+        
+        if save_model:
             # 保存最佳模型
             if not os.path.exists('checkpoints'):
                 os.makedirs('checkpoints')
@@ -425,7 +322,8 @@ def train_model():
                 'fusion_model_state_dict': fusion_model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
                 'epoch': epoch,
-                'best_val_f1': best_val_f1
+                'best_val_f1': best_val_f1,
+                'best_val_auc': best_val_auc
             }, os.path.join('checkpoints', 'best_model.pth'))
             
             # 保存训练和验证指标图表
@@ -443,10 +341,19 @@ def train_model():
                 val_metrics_history,
                 save_path=os.path.join('train_results', 'val_metrics.png')
             )
+            
+            # 保存完整训练历史
+            train_hist_df = pd.DataFrame(train_metrics_history)
+            val_hist_df = pd.DataFrame(val_metrics_history)
+            
+            train_hist_df.to_csv(os.path.join('train_results', 'train_history.csv'), index=False)
+            val_hist_df.to_csv(os.path.join('train_results', 'val_history.csv'), index=False)
         else:
             patience_counter += 1
         
-        print(f'Epoch {epoch+1}/{TRAIN_CONFIG["num_epochs"]}')
+        # 输出当前epoch的训练信息
+        current_lr = optimizer.param_groups[0]['lr']
+        print(f'Epoch {epoch+1}/{TRAIN_CONFIG["num_epochs"]} - LR: {current_lr:.6f} - Loss: {epoch_loss/len(train_data):.4f}')
         print(f'Train Metrics: {train_metrics}')
         print(f'Val Metrics: {val_metrics}')
         
@@ -454,8 +361,12 @@ def train_model():
         if 'auc' in train_metrics:
             train_auc = train_metrics['auc']
             val_auc = val_metrics['auc'] if 'auc' in val_metrics else float('nan')
+            train_ap = train_metrics.get('ap', float('nan'))
+            val_ap = val_metrics.get('ap', float('nan'))
             print(f'AUC Scores - Train: {train_auc:.4f}, Val: {val_auc:.4f}')
+            print(f'AP Scores - Train: {train_ap:.4f}, Val: {val_ap:.4f}')
         
+        # 早停检查
         if patience_counter >= TRAIN_CONFIG['early_stopping_patience']:
             print('Early stopping triggered')
             break
@@ -475,6 +386,37 @@ def train_model():
                           save_path=os.path.join(train_results_dir, 'train_metrics.png'))
     plot_metrics_over_time(val_metrics_history,
                           save_path=os.path.join(train_results_dir, 'val_metrics.png'))
+    
+    # 单独绘制AUC和AP指标的变化趋势
+    if train_metrics_history and 'auc' in train_metrics_history[0]:
+        # 提取AUC和AP数据
+        epochs = range(1, len(train_metrics_history) + 1)
+        train_auc = [m.get('auc', float('nan')) for m in train_metrics_history]
+        val_auc = [m.get('auc', float('nan')) for m in val_metrics_history]
+        train_ap = [m.get('ap', float('nan')) for m in train_metrics_history]
+        val_ap = [m.get('ap', float('nan')) for m in val_metrics_history]
+        
+        # 绘制AUC变化趋势
+        plt.figure(figsize=(10, 6))
+        plt.plot(epochs, train_auc, 'b-', label='Train AUC')
+        plt.plot(epochs, val_auc, 'r-', label='Val AUC')
+        plt.xlabel('Epoch')
+        plt.ylabel('AUC')
+        plt.title('AUC Scores Over Time')
+        plt.legend()
+        plt.grid(True)
+        plt.savefig(os.path.join(train_results_dir, 'auc_over_time.png'), dpi=300, bbox_inches='tight')
+        
+        # 绘制AP变化趋势
+        plt.figure(figsize=(10, 6))
+        plt.plot(epochs, train_ap, 'b-', label='Train AP')
+        plt.plot(epochs, val_ap, 'r-', label='Val AP')
+        plt.xlabel('Epoch')
+        plt.ylabel('AP')
+        plt.title('Average Precision Scores Over Time')
+        plt.legend()
+        plt.grid(True)
+        plt.savefig(os.path.join(train_results_dir, 'ap_over_time.png'), dpi=300, bbox_inches='tight')
 
 if __name__ == '__main__':
     train_model()
