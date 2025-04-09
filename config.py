@@ -17,8 +17,8 @@ MODEL_CONFIG = {
     'snn': {
         'in_channels': 64,
         'hidden_channels': 128,
-        'output_dim': 64,  # 增加输出维度，以便提取更丰富的团结构特征
-        'dropout': 0.3     # 增加dropout概率以减少过拟合
+        'output_dim': 64,  # 输出维度，用于提取团结构特征
+        'dropout': 0.3     # dropout概率以减少过拟合
     },
     
     # EvolveGCN配置
@@ -32,29 +32,41 @@ MODEL_CONFIG = {
     'fusion': {
         'in_channels': 64,
         'hidden_channels': 128,
-        'output_dim': 64,  # 增加输出维度以匹配SNN
-        'dropout': 0.3     # 增加dropout概率以减少过拟合
+        'output_dim': 64,  # 输出维度应与SNN匹配
+        'dropout': 0.3     # dropout概率以减少过拟合
+    },
+    
+    # 团演化预测配置
+    'evolution': {
+        'attention_dim': 64,   # 注意力机制的嵌入维度
+        'num_heads': 4,        # 多头注意力的头数
+        'dropout': 0.3,        # 注意力机制的dropout概率
+        'threshold': 0.5       # 团演化预测的概率阈值
     }
 }
 
 # 训练配置
 TRAIN_CONFIG = {
-    'num_epochs': 150,        # 增加训练轮数
+    'num_epochs': 150,                # 训练轮数
     'batch_size': 32,
-    'learning_rate': 0.0005,  # 降低学习率以实现更稳定的训练
-    'weight_decay': 5e-5,     # 增加权重衰减以减少过拟合
-    'early_stopping_patience': 15,  # 增加早停耐心值
-    'save_dir': 'checkpoints'
+    'learning_rate': 0.0005,          # 学习率
+    'weight_decay': 5e-5,             # 权重衰减以减少过拟合
+    'early_stopping_patience': 15,    # 早停耐心值
+    'save_dir': 'checkpoints',
+    'loss_weights': {
+        'node_loss_weight': 0.3,      # 节点级别损失权重
+        'evolution_loss_weight': 0.7  # 团演化预测损失权重
+    }
 }
 
 # 评估配置
 EVAL_CONFIG = {
     'metrics': ['accuracy', 'precision', 'recall', 'f1', 'auc', 'ap', 
-               'evolution_accuracy', 'evolution_precision', 'evolution_recall', 'evolution_f1'],  # 添加团演化预测指标
+               'evolution_accuracy', 'evolution_precision', 'evolution_recall', 'evolution_f1'],  # 团演化预测指标
     'visualization': {
         'plot_confusion_matrix': True,
         'plot_metrics_over_time': True,
-        'plot_evolution_metrics': True,  # 添加团演化预测指标可视化
-        'plot_attention_weights': True   # 添加注意力权重可视化
+        'plot_evolution_metrics': True,  # 团演化预测指标可视化
+        'plot_attention_weights': True   # 注意力权重可视化
     }
 }

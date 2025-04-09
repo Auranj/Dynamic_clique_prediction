@@ -149,34 +149,76 @@ def train_model():
                 # 将团列表从集合转换为列表
                 curr_cliques = [list(clique) for clique in batch['cliques']]
                 
-                # 预测团的演化
+                # 获取前一时间步的团列表(如果有)
+                prev_cliques = None
+                if t > 0 and train_data[t-1]['cliques']:
+                    prev_cliques = [list(clique) for clique in train_data[t-1]['cliques']]
+                
+                # 预测团的演化，传入前一时间步的团列表
                 evolution_prob = fusion_model.predict_evolution(
-                    x, curr_cliques, prev_features)
+                    x, curr_cliques, prev_features, prev_cliques)
                 
-                # 创建真实的演化标签
-                true_evolution = torch.zeros(len(curr_cliques), device=device)
-                for prev_idx, curr_idx in batch['clique_evolution']:
-                    if curr_idx < len(curr_cliques):
-                        true_evolution[curr_idx] = 1.0
-                
-                # 计算二元交叉熵损失
-                if len(evolution_prob) > 0 and len(true_evolution) > 0:
+                # 如果提供了前一时间步的团列表，evolution_prob是一个矩阵，需要特殊处理
+                if prev_cliques and len(prev_cliques) > 0:
+                    # 创建团演化的真实标签矩阵: [num_curr_cliques, num_prev_cliques]
+                    num_curr_cliques = len(curr_cliques)
+                    num_prev_cliques = len(prev_cliques)
+                    
+                    # 初始化全零矩阵
+                    true_evolution_matrix = torch.zeros(
+                        (num_curr_cliques, num_prev_cliques), device=device)
+                    
+                    # 填充真实标签
+                    for prev_idx, curr_idx in batch['clique_evolution']:
+                        if curr_idx < num_curr_cliques and prev_idx < num_prev_cliques:
+                            true_evolution_matrix[curr_idx, prev_idx] = 1.0
+                    
+                    # 计算二元交叉熵损失
                     evolution_criterion = nn.BCELoss()
-                    # 使用第一列作为预测概率，确保维度匹配
-                    evolution_loss = evolution_criterion(evolution_prob[:, 0], true_evolution)
+                    evolution_loss = evolution_criterion(evolution_prob, true_evolution_matrix)
                     
                     # 收集团演化预测结果
                     pred_evolution = []
-                    for i, prob in enumerate(evolution_prob):
-                        if prob[0].item() > 0.5:  # 使用0.5作为阈值，取第一个元素作为预测概率
-                            # 简化处理，假设与前一时间步的第一个团有关联
-                            pred_evolution.append((0, i))
+                    for i in range(evolution_prob.size(0)):
+                        max_prob_idx = torch.argmax(evolution_prob[i]).item()
+                        if evolution_prob[i, max_prob_idx].item() > 0.5:  # 使用0.5作为阈值
+                            pred_evolution.append((max_prob_idx, i))
+                else:
+                    # 创建真实的演化标签向量
+                    true_evolution = torch.zeros(len(curr_cliques), device=device)
+                    for prev_idx, curr_idx in batch['clique_evolution']:
+                        if curr_idx < len(curr_cliques):
+                            true_evolution[curr_idx] = 1.0
                     
-                    train_clique_evolution_true.append(batch['clique_evolution'])
-                    train_clique_evolution_pred.append(pred_evolution)
+                    # 计算二元交叉熵损失
+                    if len(evolution_prob) > 0 and len(true_evolution) > 0:
+                        evolution_criterion = nn.BCELoss()
+                        # 确保维度匹配
+                        if evolution_prob.dim() == 2:  # 如果是二维张量[num_cliques, 1]
+                            evolution_loss = evolution_criterion(evolution_prob.squeeze(1), true_evolution)
+                        else:
+                            evolution_loss = evolution_criterion(evolution_prob, true_evolution)
+                        
+                        # 收集团演化预测结果
+                        pred_evolution = []
+                        for i, prob in enumerate(evolution_prob):
+                            if prob[0].item() > 0.5:  # 使用0.5作为阈值
+                                # 简化处理，假设与前一时间步的第一个团有关联
+                                pred_evolution.append((0, i))
+                
+                # 添加调试信息
+                print(f"[训练 调试] 时间步 {t}: 真实团演化关系数量: {len(batch['clique_evolution'])}, 预测团演化关系数量: {len(pred_evolution)}")
+                train_clique_evolution_true.append(batch['clique_evolution'])
+                train_clique_evolution_pred.append(pred_evolution)
             
-            # 总损失 = 节点级别损失 + 团演化损失
-            loss = node_loss * 0.3 + evolution_loss * 0.7 if evolution_loss > 0 else node_loss
+            # 总损失 = 节点级别损失 * 节点权重 + 团演化损失 * 演化权重
+            node_loss_weight = TRAIN_CONFIG['loss_weights']['node_loss_weight']
+            evolution_loss_weight = TRAIN_CONFIG['loss_weights']['evolution_loss_weight']
+            
+            if evolution_loss > 0:
+                loss = node_loss * node_loss_weight + evolution_loss * evolution_loss_weight
+            else:
+                loss = node_loss
             
             # 反向传播和优化
             optimizer.zero_grad()
@@ -235,23 +277,41 @@ def train_model():
                     # 将团列表从集合转换为列表
                     curr_cliques = [list(clique) for clique in batch['cliques']]
                     
-                    # 预测团的演化
+                    # 获取前一时间步的团列表(如果有)
+                    prev_cliques = None
+                    if t > 0 and val_data[t-1]['cliques']:
+                        prev_cliques = [list(clique) for clique in val_data[t-1]['cliques']]
+                    
+                    # 预测团的演化，传入前一时间步的团列表
                     evolution_prob = fusion_model.predict_evolution(
-                        x, curr_cliques, prev_features)
+                        x, curr_cliques, prev_features, prev_cliques)
                     
                     # 如果有真实的团演化数据，收集评估数据
                     if batch['clique_evolution'] is not None:
                         # 真实的团演化关系
                         true_evolution = batch['clique_evolution']
                         
-                        # 根据概率阈值确定预测的演化关系
+                        # 根据概率预测团演化关系
                         pred_evolution = []
-                        for i, prob in enumerate(evolution_prob):
-                            if prob[0].item() > 0.5:  # 使用0.5作为阈值，取第一个元素作为预测概率
-                                # 找到对应的前一时间步的团索引
-                                # 这里简化处理，假设与前一时间步的第一个团有关联
-                                pred_evolution.append((0, i))
                         
+                        # 如果提供了前一时间步的团列表，evolution_prob是一个矩阵
+                        if prev_cliques and len(prev_cliques) > 0:
+                            # 对每个当前团，找到与之关联概率最高的前一时间步团
+                            for i in range(evolution_prob.size(0)):
+                                max_prob_idx = torch.argmax(evolution_prob[i]).item()
+                                if evolution_prob[i, max_prob_idx].item() > 0.5:  # 使用0.5作为阈值
+                                    pred_evolution.append((max_prob_idx, i))
+                        else:
+                            # 否则，使用全局判断
+                            for i, prob in enumerate(evolution_prob):
+                                if prob[0].item() > 0.5:  # 使用0.5作为阈值
+                                    # 简化处理：假设与前一时间步的第一个团有关联
+                                    pred_evolution.append((0, i))
+                        
+                        # 调试信息
+                        print(f"[调试] 时间步 {t}: 真实团演化关系数量: {len(true_evolution)}, 预测团演化关系数量: {len(pred_evolution)}")
+                        
+                        # 添加到评估列表
                         clique_evolution_true.append(true_evolution)
                         clique_evolution_pred.append(pred_evolution)
                 
@@ -281,6 +341,8 @@ def train_model():
         if 'evolution_f1' in val_metrics and val_metrics['evolution_f1'] > best_val_f1:
             best_val_f1 = val_metrics['evolution_f1']
             patience_counter = 0
+            
+            print(f"[信息] 保存新的最佳模型，团演化F1: {best_val_f1:.4f}")
             
             # 保存最佳模型
             if not os.path.exists('checkpoints'):
