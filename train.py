@@ -338,17 +338,42 @@ def train_model():
         
         # 评估团演化预测
         if clique_evolution_true and clique_evolution_pred:
-            # 使用新的评估函数计算详细指标
-            evolution_metrics = evaluate_clique_evolution(clique_evolution_true, clique_evolution_pred)
-            
-            print(f'团演化预测指标:')
-            print(f'  - 准确率: {evolution_metrics["evolution_accuracy"]:.4f}')
-            print(f'  - 精确率: {evolution_metrics["evolution_precision"]:.4f}')
-            print(f'  - 召回率: {evolution_metrics["evolution_recall"]:.4f}')
-            print(f'  - F1值: {evolution_metrics["evolution_f1"]:.4f}')
-            
-            # 将团演化预测指标添加到验证指标中
-            val_metrics.update(evolution_metrics)
+            # 使用新的评估函数计算详细指标，并显式处理异常
+            try:
+                # 确保传入的数据不为空
+                if all(len(data) > 0 for data in clique_evolution_true if data is not None) and \
+                   all(len(data) > 0 for data in clique_evolution_pred if data is not None):
+                    evolution_metrics = evaluate_clique_evolution(
+                        clique_evolution_true, 
+                        clique_evolution_pred,
+                        verbose=True  # 启用详细输出以便调试
+                    )
+                    
+                    print(f'团演化预测指标:')
+                    # 加入检查确保键存在
+                    if 'accuracy' in evolution_metrics:
+                        print(f'  - 准确率: {evolution_metrics.get("accuracy", 0.0):.4f}')
+                    if 'precision' in evolution_metrics:
+                        print(f'  - 精确率: {evolution_metrics.get("precision", 0.0):.4f}')
+                    if 'recall' in evolution_metrics:
+                        print(f'  - 召回率: {evolution_metrics.get("recall", 0.0):.4f}')
+                    if 'f1' in evolution_metrics:
+                        print(f'  - F1值: {evolution_metrics.get("f1", 0.0):.4f}')
+                    
+                    # 为了兼容性，确保必要的键存在
+                    evolution_metrics.setdefault('evolution_accuracy', evolution_metrics.get('accuracy', 0.0))
+                    evolution_metrics.setdefault('evolution_precision', evolution_metrics.get('precision', 0.0))
+                    evolution_metrics.setdefault('evolution_recall', evolution_metrics.get('recall', 0.0))
+                    evolution_metrics.setdefault('evolution_f1', evolution_metrics.get('f1', 0.0))
+                    
+                    # 将团演化预测指标添加到验证指标中
+                    val_metrics.update(evolution_metrics)
+                else:
+                    print("警告: 部分演化预测数据为空，跳过团演化评估")
+            except Exception as e:
+                print(f"评估团演化预测时出错: {str(e)}")
+                import traceback
+                traceback.print_exc()
         
         # 早停检查
         if 'evolution_f1' in val_metrics and val_metrics['evolution_f1'] > best_val_f1:

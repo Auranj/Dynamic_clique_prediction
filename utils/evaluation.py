@@ -197,9 +197,10 @@ def evaluate_clique_evolution(y_true, y_pred, threshold=0.5, verbose=False):
     支持评估不同类型的演化关系（继续、增长、萎缩、分裂、合并）。
 
     Args:
-        y_true (dict): 真实的团演化关系，格式为 time_step -> List[(prev_idx, curr_idx, evolution_type)]
-        y_pred (dict): 预测的团演化关系概率，格式为 time_step -> List[(prev_idx, curr_idx, prob, evolution_type)]
-                      或 time_step -> List[(prev_idx, curr_idx, prob)] (旧版本兼容)
+        y_true (dict or list): 真实的团演化关系，可以是字典格式 time_step -> List[(prev_idx, curr_idx, evolution_type)]
+                              或者列表格式 [time_step_1_data, time_step_2_data, ...]
+        y_pred (dict or list): 预测的团演化关系概率，可以是字典格式 time_step -> List[(prev_idx, curr_idx, prob, evolution_type)]
+                              或者列表格式 [time_step_1_data, time_step_2_data, ...]
         threshold (float, optional): 预测概率阈值，默认为 0.5
         verbose (bool, optional): 是否打印详细评估信息，默认为 False
 
@@ -212,6 +213,22 @@ def evaluate_clique_evolution(y_true, y_pred, threshold=0.5, verbose=False):
             'accuracy': 0.0, 'precision': 0.0, 'recall': 0.0, 'f1': 0.0,
             'ap': 0.0, 'auc': 0.0
         }
+    
+    # 转换输入格式：如果是列表，转为字典
+    if isinstance(y_true, list) and isinstance(y_pred, list):
+        y_true_dict = {}
+        y_pred_dict = {}
+        
+        for i, time_step_data in enumerate(y_true):
+            if time_step_data:  # 只添加非空数据
+                y_true_dict[i] = time_step_data
+        
+        for i, time_step_data in enumerate(y_pred):
+            if time_step_data:  # 只添加非空数据
+                y_pred_dict[i] = time_step_data
+        
+        y_true = y_true_dict
+        y_pred = y_pred_dict
 
     # 转换真实标签和预测为评估格式
     labels = []
@@ -237,48 +254,84 @@ def evaluate_clique_evolution(y_true, y_pred, threshold=0.5, verbose=False):
         curr_true_evol = set()
         curr_pred_evol = set()
         
-        # 添加真实的演化关系
-        for relation in y_true[t]:
-            if len(relation) == 3:  # 新格式: (prev_idx, curr_idx, evolution_type)
-                prev_idx, curr_idx, evol_type = relation
-            else:  # 旧格式: (prev_idx, curr_idx)
-                prev_idx, curr_idx = relation
-                evol_type = 'continue'  # 默认为继续类型
-                
-            curr_true_evol.add((prev_idx, curr_idx))
-            total_true += 1
-            type_statistics[evol_type]['true'] += 1
+        try:
+            # 添加真实的演化关系
+            for relation in y_true[t]:
+                if not relation:  # 跳过空关系
+                    continue
+                    
+                try:
+                    if len(relation) == 3:  # 新格式: (prev_idx, curr_idx, evolution_type)
+                        prev_idx, curr_idx, evol_type = relation
+                    else:  # 旧格式: (prev_idx, curr_idx)
+                        prev_idx, curr_idx = relation
+                        evol_type = 'continue'  # 默认为继续类型
+                        
+                    # 确保evol_type是有效的类型
+                    if evol_type not in type_labels:
+                        evol_type = 'continue'  # 默认类型
+                        
+                    curr_true_evol.add((prev_idx, curr_idx))
+                    total_true += 1
+                    type_statistics[evol_type]['true'] += 1
+                except Exception as e:
+                    if verbose:
+                        print(f"处理真实关系时出错: {e}, 关系: {relation}")
+                    continue
             
-        # 处理预测的演化关系
-        for relation in y_pred[t]:
-            if len(relation) == 4:  # 新格式: (prev_idx, curr_idx, prob, evolution_type)
-                prev_idx, curr_idx, prob, evol_type = relation
-            elif len(relation) == 3:  # 旧格式: (prev_idx, curr_idx, prob)
-                prev_idx, curr_idx, prob = relation
-                evol_type = 'continue'  # 默认为继续类型
-            else:
-                continue
-                
-            # 添加到总体评估数据
-            labels.append(1 if (prev_idx, curr_idx) in curr_true_evol else 0)
-            scores.append(prob)
-            pred = 1 if prob >= threshold else 0
-            predictions.append(pred)
-            
-            # 添加到类型特定的评估数据
-            type_labels[evol_type].append(1 if (prev_idx, curr_idx) in curr_true_evol else 0)
-            type_scores[evol_type].append(prob)
-            type_predictions[evol_type].append(pred)
-            
-            # 统计预测和正确数量
-            if pred == 1:
-                curr_pred_evol.add((prev_idx, curr_idx))
-                total_pred += 1
-                type_statistics[evol_type]['pred'] += 1
-                
-                if (prev_idx, curr_idx) in curr_true_evol:
-                    total_correct += 1
-                    type_statistics[evol_type]['correct'] += 1
+            # 处理预测的演化关系
+            for relation in y_pred[t]:
+                if not relation:  # 跳过空关系
+                    continue
+                    
+                try:
+                    if len(relation) == 4:  # 新格式: (prev_idx, curr_idx, prob, evolution_type)
+                        prev_idx, curr_idx, prob, evol_type = relation
+                    elif len(relation) == 3:  # 旧格式: (prev_idx, curr_idx, prob)
+                        prev_idx, curr_idx, prob = relation
+                        evol_type = 'continue'  # 默认为继续类型
+                    else:
+                        if verbose:
+                            print(f"跳过无效的关系格式: {relation}")
+                        continue
+                    
+                    # 确保evol_type是有效的类型
+                    if evol_type not in type_labels:
+                        evol_type = 'continue'  # 默认类型
+                    
+                    # 确保prob是浮点数
+                    try:
+                        prob = float(prob)
+                    except:
+                        prob = 0.5  # 默认概率
+                    
+                    # 添加到总体评估数据
+                    labels.append(1 if (prev_idx, curr_idx) in curr_true_evol else 0)
+                    scores.append(prob)
+                    pred = 1 if prob >= threshold else 0
+                    predictions.append(pred)
+                    
+                    # 添加到类型特定的评估数据
+                    type_labels[evol_type].append(1 if (prev_idx, curr_idx) in curr_true_evol else 0)
+                    type_scores[evol_type].append(prob)
+                    type_predictions[evol_type].append(pred)
+                    
+                    # 统计预测和正确数量
+                    if pred == 1:
+                        curr_pred_evol.add((prev_idx, curr_idx))
+                        total_pred += 1
+                        type_statistics[evol_type]['pred'] += 1
+                        
+                        if (prev_idx, curr_idx) in curr_true_evol:
+                            total_correct += 1
+                            type_statistics[evol_type]['correct'] += 1
+                except Exception as e:
+                    if verbose:
+                        print(f"处理预测关系时出错: {e}, 关系: {relation}")
+                    continue
+        except Exception as e:
+            print(f"处理时间步 {t} 数据时出错: {e}")
+            continue
     
     # 计算总体评估指标
     results = {}
