@@ -4,11 +4,13 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
+import networkx as nx
+from tqdm import tqdm
 from data.data_loader import DataLoader, load_bitcoin_data
 from models.snn import SimplexNeuralNetwork as SNN
 from models.evolvegcn import EvolveGCN
 from models.fusion_model import SNNEvolveGCN as FusionModel
-from utils.evaluation import evaluate_temporal_prediction
+from utils.evaluation import evaluate_temporal_prediction, evaluate_clique_prediction, evaluate_clique_evolution
 from utils.visualization import plot_clique_prediction, plot_confusion_matrix, plot_metrics_over_time
 from config import DATASET_CONFIG, MODEL_CONFIG, TRAIN_CONFIG, EVAL_CONFIG
 
@@ -122,29 +124,36 @@ def evaluate_model():
     # 加载最佳模型
     checkpoint_path = os.path.join(TRAIN_CONFIG['save_dir'], 'best_model.pth')
     if os.path.exists(checkpoint_path):
-        checkpoint = torch.load(checkpoint_path)
+        checkpoint = torch.load(checkpoint_path, map_location=device)
         snn.load_state_dict(checkpoint['snn_state_dict'])
         evolvegcn.load_state_dict(checkpoint['evolvegcn_state_dict'])
         fusion_model.load_state_dict(checkpoint['fusion_model_state_dict'])
-        print(f"Loaded model from epoch {checkpoint['epoch']} with best val F1: {checkpoint['best_val_f1']}")
+        print(f"加载最佳模型，Epoch: {checkpoint['epoch']}, 验证F1值: {checkpoint['best_val_f1']:.4f}")
     else:
-        print("No checkpoint found. Please train the model first.")
-        return
+        print("未找到模型检查点，使用随机初始化的模型")
     
-    # 评估阶段
+    # 设置为评估模式
     snn.eval()
     evolvegcn.eval()
     fusion_model.eval()
     
+    # 记录测试结果
     test_pred_list = []
     test_true_list = []
     test_score_list = []
     test_metrics_list = []
     
-    # 记录每个时间步的预测和真实团节点数量
+    # 记录团大小等信息
     clique_sizes = []
     
+    # 团演化预测评估
+    clique_evolution_true = []
+    clique_evolution_pred = []
+    clique_evolution_prob = []  # 保存预测概率，用于绘制PR曲线和ROC曲线
+    
     with torch.no_grad():
+        prev_features = None
+        
         for t in range(len(test_data)):
             batch = test_data[t]
             x, adj, y = batch['features'], batch['adj'], batch['labels']
@@ -185,6 +194,34 @@ def evaluate_model():
                 'overlap_size': len(set(batch['clique_nodes']).intersection(set(pred_nodes)))
             })
             
+            # 团演化预测评估（从第二个时间步开始）
+            if batch['cliques'] and t > 0:
+                # 将团列表从集合转换为列表
+                curr_cliques = [list(clique) for clique in batch['cliques']]
+                
+                # 预测团的演化
+                evolution_prob = fusion_model.predict_evolution(
+                    x, curr_cliques, prev_features)
+                
+                # 如果有真实的团演化数据，收集评估数据
+                if batch['clique_evolution'] is not None:
+                    # 真实的团演化关系
+                    true_evolution = batch['clique_evolution']
+                    
+                    # 根据概率阈值确定预测的演化关系
+                    pred_evolution = []
+                    for i, prob in enumerate(evolution_prob):
+                        if prob[0].item() > 0.5:  # 使用0.5作为阈值
+                            # 简化处理，假设与前一时间步的第一个团有关联
+                            pred_evolution.append((0, i))
+                    
+                    clique_evolution_true.append(true_evolution)
+                    clique_evolution_pred.append(pred_evolution)
+                    
+                    # 保存预测概率，用于后续分析
+                    probs_list = [(i, prob[0].item()) for i, prob in enumerate(evolution_prob)]
+                    clique_evolution_prob.append(probs_list)
+            
             # 可视化预测结果（每10个时间步可视化一次）
             if t % 10 == 0 or t == len(test_data) - 1:  # 每10个时间步可视化一次，以及最后一个时间步
                 # 可视化真实团和预测团并保存
@@ -195,14 +232,52 @@ def evaluate_model():
                     time_step=t,
                     save_path=os.path.join(test_results_dir, f'clique_prediction_t{t}.png')
                 )
+            
+            # 更新前一时间步的特征
+            prev_features = x.clone()
     
     # 计算测试指标
     test_metrics = evaluate_temporal_prediction(
         test_true_list, test_pred_list, test_score_list)
     
-    print("\nTest Metrics:")
+    print("\n节点级别测试指标:")
     for metric, value in test_metrics.items():
         print(f"{metric}: {value:.4f}")
+    
+    # 评估团演化预测
+    if clique_evolution_true and clique_evolution_pred:
+        evolution_metrics = evaluate_clique_evolution(clique_evolution_true, clique_evolution_pred)
+        
+        print("\n团演化预测指标:")
+        for metric, value in evolution_metrics.items():
+            print(f"{metric.replace('evolution_', '')}: {value:.4f}")
+        
+        # 更新测试指标，包括团演化预测指标
+        test_metrics.update(evolution_metrics)
+        
+        # 可视化团演化预测结果
+        # 1. 计算每个时间步的演化指标
+        time_step_metrics = []
+        for i, (true_evol, pred_evol) in enumerate(zip(clique_evolution_true, clique_evolution_pred)):
+            time_metrics = evaluate_clique_evolution([true_evol], [pred_evol])
+            time_metrics['time_step'] = i + 1  # 从第1个时间步开始计数
+            time_step_metrics.append(time_metrics)
+        
+        # 2. 绘制随时间变化的团演化预测指标
+        if time_step_metrics:
+            metrics_df = pd.DataFrame(time_step_metrics)
+            plt.figure(figsize=(12, 6))
+            
+            metrics_to_plot = ['evolution_accuracy', 'evolution_precision', 'evolution_recall', 'evolution_f1']
+            for metric in metrics_to_plot:
+                plt.plot(metrics_df['time_step'], metrics_df[metric], marker='o', label=metric.replace('evolution_', ''))
+            
+            plt.xlabel('Time Step')
+            plt.ylabel('Score')
+            plt.title('Evolution Prediction Metrics Over Time')
+            plt.legend()
+            plt.grid(True)
+            plt.savefig(os.path.join(test_results_dir, 'evolution_metrics_over_time.png'), dpi=300, bbox_inches='tight')
     
     # 保存测试指标到CSV文件
     metrics_df = pd.DataFrame([test_metrics])
@@ -231,53 +306,71 @@ def evaluate_model():
             save_path=os.path.join(test_results_dir, 'confusion_matrix.png')
         )
     
-    # 绘制测试指标随时间变化的趋势
-    plot_metrics_over_time(
-        test_metrics_list,
-        save_path=os.path.join(test_results_dir, 'test_metrics_over_time.png')
-    )
+    # 绘制测试指标随时间变化的曲线
+    if EVAL_CONFIG['visualization']['plot_metrics_over_time']:
+        # 收集每个时间步的指标
+        metrics_by_time = []
+        for t, metrics in enumerate(test_metrics_list):
+            metrics_dict = {'time_step': t}
+            metrics_dict.update(metrics)
+            metrics_by_time.append(metrics_dict)
+        
+        metrics_df = pd.DataFrame(metrics_by_time)
+        
+        # 绘制各个指标随时间变化的曲线
+        plt.figure(figsize=(12, 8))
+        
+        # 要绘制的指标
+        metrics_to_plot = ['accuracy', 'precision', 'recall', 'f1', 'auc', 'ap']
+        
+        for metric in metrics_to_plot:
+            if metric in metrics_df.columns:
+                plt.plot(metrics_df['time_step'], metrics_df[metric], marker='.', label=metric)
+        
+        plt.xlabel('Time Step')
+        plt.ylabel('Score')
+        plt.title('Test Metrics Over Time')
+        plt.legend()
+        plt.grid(True)
+        plt.savefig(os.path.join(test_results_dir, 'test_metrics_over_time.png'), dpi=300, bbox_inches='tight')
     
-    # 绘制团大小随时间变化的趋势
-    plt.figure(figsize=(12, 6))
-    plt.plot([d['time_step'] for d in clique_sizes], 
-             [d['true_clique_size'] for d in clique_sizes], 
-             'g-', label='True Clique Size')
-    plt.plot([d['time_step'] for d in clique_sizes], 
-             [d['pred_clique_size'] for d in clique_sizes], 
-             'r-', label='Predicted Clique Size')
-    plt.plot([d['time_step'] for d in clique_sizes], 
-             [d['overlap_size'] for d in clique_sizes], 
-             'b-', label='Overlap Size')
-    plt.xlabel('Time Step')
-    plt.ylabel('Number of Nodes')
-    plt.title('Clique Size Comparison Over Time')
-    plt.legend()
-    plt.grid(True)
-    plt.savefig(os.path.join(test_results_dir, 'clique_size_comparison.png'), dpi=300, bbox_inches='tight')
+    # 分析重叠率
+    if clique_sizes:
+        # 计算重叠率（真实团和预测团的交集/并集）
+        overlap_rates = []
+        
+        for item in clique_sizes:
+            true_size = item['true_clique_size']
+            pred_size = item['pred_clique_size']
+            overlap = item['overlap_size']
+            
+            # 计算重叠率（Jaccard相似度）
+            union_size = true_size + pred_size - overlap
+            if union_size > 0:
+                overlap_rate = overlap / union_size
+            else:
+                overlap_rate = 1.0  # 如果两者都为空，则认为完全匹配
+            
+            overlap_rates.append({
+                'time_step': item['time_step'],
+                'overlap_rate': overlap_rate
+            })
+        
+        # 绘制重叠率随时间变化的曲线
+        overlap_df = pd.DataFrame(overlap_rates)
+        
+        plt.figure(figsize=(10, 6))
+        plt.plot(overlap_df['time_step'], overlap_df['overlap_rate'], marker='o')
+        plt.xlabel('Time Step')
+        plt.ylabel('Overlap Rate')
+        plt.title('Clique Prediction Overlap Rate Over Time')
+        plt.grid(True)
+        plt.savefig(os.path.join(test_results_dir, 'overlap_rate.png'), dpi=300, bbox_inches='tight')
+        
+        # 保存重叠率数据
+        overlap_df.to_csv(os.path.join(test_results_dir, 'overlap_rate.csv'), index=False)
     
-    # 绘制预测准确率热图
-    accuracy_matrix = np.zeros((len(test_data), 1))
-    for t in range(len(test_data)):
-        accuracy_matrix[t, 0] = test_metrics_list[t]['accuracy']
-    
-    plt.figure(figsize=(10, 8))
-    sns.heatmap(accuracy_matrix, annot=True, fmt='.4f', cmap='YlGnBu')
-    plt.xlabel('Metrics')
-    plt.ylabel('Time Step')
-    plt.title('Prediction Accuracy Over Time')
-    plt.savefig(os.path.join(test_results_dir, 'accuracy_heatmap.png'), dpi=300, bbox_inches='tight')
-    
-    # 绘制重叠率（Overlap Rate）
-    overlap_rates = [d['overlap_size'] / d['true_clique_size'] if d['true_clique_size'] > 0 else 0 
-                    for d in clique_sizes]
-    
-    plt.figure(figsize=(12, 6))
-    plt.plot([d['time_step'] for d in clique_sizes], overlap_rates, 'b-', marker='o')
-    plt.xlabel('Time Step')
-    plt.ylabel('Overlap Rate')
-    plt.title('Clique Prediction Overlap Rate Over Time')
-    plt.grid(True)
-    plt.savefig(os.path.join(test_results_dir, 'overlap_rate.png'), dpi=300, bbox_inches='tight')
+    print(f"\n测试完成，结果已保存到 {test_results_dir} 目录")
 
 if __name__ == '__main__':
     evaluate_model()

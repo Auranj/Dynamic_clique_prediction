@@ -6,7 +6,7 @@ from data.data_loader import DataLoader, load_bitcoin_data
 from models.snn import SimplexNeuralNetwork as SNN
 from models.evolvegcn import EvolveGCN
 from models.fusion_model import SNNEvolveGCN as FusionModel
-from utils.evaluation import evaluate_temporal_prediction, evaluate_clique_prediction
+from utils.evaluation import evaluate_temporal_prediction, evaluate_clique_prediction, evaluate_clique_evolution
 from utils.visualization import plot_metrics_over_time
 from config import DATASET_CONFIG, MODEL_CONFIG, TRAIN_CONFIG
 import os
@@ -176,9 +176,7 @@ def train_model():
                     train_clique_evolution_pred.append(pred_evolution)
             
             # 总损失 = 节点级别损失 + 团演化损失
-            loss = node_loss
-            if evolution_loss > 0:
-                loss += evolution_loss
+            loss = node_loss * 0.3 + evolution_loss * 0.7 if evolution_loss > 0 else node_loss
             
             # 反向传播和优化
             optimizer.zero_grad()
@@ -267,32 +265,53 @@ def train_model():
         
         # 评估团演化预测
         if clique_evolution_true and clique_evolution_pred:
-            # 计算团演化预测的准确率
-            evolution_accuracy = 0.0
-            evolution_total = 0
+            # 使用新的评估函数计算详细指标
+            evolution_metrics = evaluate_clique_evolution(clique_evolution_true, clique_evolution_pred)
             
-            for true_evol, pred_evol in zip(clique_evolution_true, clique_evolution_pred):
-                # 将预测和真实的演化关系转换为集合以便比较
-                true_set = set([(t[0], t[1]) for t in true_evol])
-                pred_set = set([(p[0], p[1]) for p in pred_evol])
-                
-                # 计算正确预测的数量
-                correct = len(true_set.intersection(pred_set))
-                total = len(true_set)
-                
-                if total > 0:
-                    evolution_accuracy += correct / total
-                    evolution_total += 1
+            print(f'团演化预测指标:')
+            print(f'  - 准确率: {evolution_metrics["evolution_accuracy"]:.4f}')
+            print(f'  - 精确率: {evolution_metrics["evolution_precision"]:.4f}')
+            print(f'  - 召回率: {evolution_metrics["evolution_recall"]:.4f}')
+            print(f'  - F1值: {evolution_metrics["evolution_f1"]:.4f}')
             
-            if evolution_total > 0:
-                evolution_accuracy /= evolution_total
-                print(f'团演化预测准确率: {evolution_accuracy:.4f}')
-                
-                # 将团演化预测准确率添加到验证指标中
-                val_metrics['evolution_accuracy'] = evolution_accuracy
+            # 将团演化预测指标添加到验证指标中
+            val_metrics.update(evolution_metrics)
         
         # 早停检查
-        if val_metrics['f1'] > best_val_f1:
+        if 'evolution_f1' in val_metrics and val_metrics['evolution_f1'] > best_val_f1:
+            best_val_f1 = val_metrics['evolution_f1']
+            patience_counter = 0
+            
+            # 保存最佳模型
+            if not os.path.exists('checkpoints'):
+                os.makedirs('checkpoints')
+            
+            torch.save({
+                'snn_state_dict': snn.state_dict(),
+                'evolvegcn_state_dict': evolvegcn.state_dict(),
+                'fusion_model_state_dict': fusion_model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'epoch': epoch,
+                'best_val_f1': best_val_f1
+            }, os.path.join('checkpoints', 'best_model.pth'))
+            
+            # 保存训练和验证指标图表
+            if not os.path.exists('train_results'):
+                os.makedirs('train_results')
+            
+            # 绘制训练指标图表
+            plot_metrics_over_time(
+                train_metrics_history,
+                save_path=os.path.join('train_results', 'train_metrics.png')
+            )
+            
+            # 绘制验证指标图表
+            plot_metrics_over_time(
+                val_metrics_history,
+                save_path=os.path.join('train_results', 'val_metrics.png')
+            )
+        elif val_metrics['f1'] > best_val_f1 and 'evolution_f1' not in val_metrics:
+            # 如果没有团演化指标，则回退到使用节点F1值
             best_val_f1 = val_metrics['f1']
             patience_counter = 0
             

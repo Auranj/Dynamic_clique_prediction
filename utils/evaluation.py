@@ -191,3 +191,91 @@ def evaluate_temporal_prediction(y_true_list, y_pred_list, y_score_list=None):
                 avg_metrics[metric] = 0.0
     
     return avg_metrics
+
+def evaluate_clique_evolution(true_evolution_list, pred_evolution_list):
+    """
+    评估团演化预测的性能
+    
+    Args:
+        true_evolution_list: 各时间步的真实团演化关系列表，每个元素是一个列表，包含多个(prev_idx, curr_idx)元组
+        pred_evolution_list: 各时间步的预测团演化关系列表，每个元素是一个列表，包含多个(prev_idx, curr_idx)元组
+        
+    Returns:
+        dict: 包含评估指标的字典，包括准确率、精确率、召回率、F1值
+    """
+    if not true_evolution_list or not pred_evolution_list:
+        return {
+            'evolution_accuracy': 0.0,
+            'evolution_precision': 0.0,
+            'evolution_recall': 0.0,
+            'evolution_f1': 0.0
+        }
+    
+    # 初始化指标
+    total_accuracy = 0.0
+    total_precision = 0.0
+    total_recall = 0.0
+    total_f1 = 0.0
+    valid_steps = 0
+    
+    # 遍历每个时间步
+    for true_evol, pred_evol in zip(true_evolution_list, pred_evolution_list):
+        if not true_evol and not pred_evol:
+            continue  # 跳过没有演化关系的时间步
+            
+        # 将预测和真实的演化关系转换为集合以便比较
+        true_set = set([(t[0], t[1]) for t in true_evol])
+        pred_set = set([(p[0], p[1]) for p in pred_evol])
+        
+        # 计算各项指标
+        if true_set or pred_set:  # 确保至少有一个不为空
+            valid_steps += 1
+            
+            # 准确率：正确预测的演化关系数量除以总数
+            intersection = true_set.intersection(pred_set)
+            union = true_set.union(pred_set)
+            
+            if union:
+                accuracy = len(intersection) / len(union)
+            else:
+                accuracy = 1.0  # 如果两者都为空，则认为完全正确
+                
+            # 精确率：正确预测的演化关系数量除以预测的演化关系总数
+            if pred_set:
+                precision = len(intersection) / len(pred_set)
+            else:
+                precision = 0.0 if true_set else 1.0
+                
+            # 召回率：正确预测的演化关系数量除以真实的演化关系总数
+            if true_set:
+                recall = len(intersection) / len(true_set)
+            else:
+                recall = 1.0 if not pred_set else 0.0
+                
+            # F1值：精确率和召回率的调和平均
+            if precision + recall > 0:
+                f1 = 2 * precision * recall / (precision + recall)
+            else:
+                f1 = 0.0
+                
+            # 累加指标
+            total_accuracy += accuracy
+            total_precision += precision
+            total_recall += recall
+            total_f1 += f1
+    
+    # 计算平均指标
+    if valid_steps > 0:
+        return {
+            'evolution_accuracy': total_accuracy / valid_steps,
+            'evolution_precision': total_precision / valid_steps,
+            'evolution_recall': total_recall / valid_steps,
+            'evolution_f1': total_f1 / valid_steps
+        }
+    else:
+        return {
+            'evolution_accuracy': 0.0,
+            'evolution_precision': 0.0,
+            'evolution_recall': 0.0,
+            'evolution_f1': 0.0
+        }

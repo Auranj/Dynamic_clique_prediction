@@ -115,29 +115,45 @@ class SimplexNeuralNetwork(nn.Module):
         
         return x
     
-    def extract_clique_features(self, x: torch.Tensor, cliques: List[List[int]]) -> torch.Tensor:
-        """提取团结构特征。
-
+    def extract_clique_features(self, features: torch.Tensor, cliques: List[List[int]]) -> torch.Tensor:
+        """提取团的特征表示。
+        
         Args:
-            x: 节点特征矩阵，形状为[num_nodes, hidden_channels]
-            cliques: 团列表，每个团是节点索引列表
-
+            features: 节点特征，形状为[num_nodes, feature_dim]
+            cliques: 团列表，每个团是一个节点索引列表
+            
         Returns:
-            团特征矩阵，形状为[num_cliques, hidden_channels]
+            clique_features: 团特征，形状为[num_cliques, feature_dim]
         """
-        num_nodes = x.size(0)
+        # 获取节点数量，用于边界检查
+        num_nodes = features.size(0)
+        feature_dim = features.size(1)
+        
+        # 提取每个团的特征
         clique_features = []
         for clique in cliques:
             # 过滤掉无效的节点索引
             valid_indices = [idx for idx in clique if 0 <= idx < num_nodes]
+            
             if not valid_indices:
                 # 如果没有有效索引，使用零向量
-                clique_feature = torch.zeros(x.size(1), device=x.device)
+                clique_feature = torch.zeros(feature_dim, device=features.device)
             else:
                 # 获取团中节点的特征
-                clique_node_features = x[valid_indices]
-                # 使用最大池化聚合团特征
-                clique_feature = torch.max(clique_node_features, dim=0)[0]
-            clique_features.append(clique_feature)
+                clique_node_features = features[valid_indices]
+                
+                # 结合多种池化方法以获取更丰富的团表示
+                max_pool = torch.max(clique_node_features, dim=0)[0]  # 最大池化
+                mean_pool = torch.mean(clique_node_features, dim=0)   # 平均池化
+                
+                # 组合池化结果
+                clique_feature = (max_pool + mean_pool) / 2
             
+            clique_features.append(clique_feature)
+        
+        # 如果团列表为空，返回空张量
+        if not clique_features:
+            return torch.empty((0, feature_dim), device=features.device)
+        
+        # 将特征列表堆叠成张量
         return torch.stack(clique_features)
